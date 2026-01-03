@@ -40,7 +40,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Add cargo bin to PATH
         shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+        run: |
+          $candidates = @(
+            "$env:USERPROFILE\.cargo\bin",
+            "C:\Users\Docker\.cargo\bin",
+            "C:\Users\Docker\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin",
+            "C:\Program Files\Rust stable MSVC 1.0\bin",
+            "C:\Program Files\Rust stable GNU 1.0\bin",
+            "C:\Rust\.cargo\bin"
+          )
+          foreach ($p in $candidates) {
+            if (Test-Path (Join-Path $p "cargo.exe")) {
+              Add-Content $env:GITHUB_PATH $p
+              break
+            }
+          }
 
       - uses: Swatinem/rust-cache@v2
         with:
