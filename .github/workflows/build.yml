@@ -38,6 +38,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add cargo bin to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -52,7 +56,9 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: cargo build --release --target ${{ env.TARGET }}
+        run: |
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          cargo build --release --target ${{ env.TARGET }}
 
       - name: Package binary (zip)
         shell: pwsh
