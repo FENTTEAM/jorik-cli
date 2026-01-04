@@ -38,7 +38,8 @@ enum Commands {
     /// Enqueue audio to play
     Play {
         /// Query/URL to play
-        query: String,
+        #[arg(num_args = 1..)]
+        query: Vec<String>,
         /// Guild ID (optional)
         #[arg(long)]
         guild_id: Option<String>,
@@ -198,7 +199,7 @@ async fn main() -> Result<()> {
                 action: "play",
                 guild_id,
                 channel_id,
-                query,
+                query: query.join(" "),
                 user_id,
                 requested_by,
                 avatar_url,
