@@ -28,6 +28,7 @@ ArchitecturesInstallIn64BitMode=x64
 Compression=lzma
 SolidCompression=yes
 ChangesEnvironment=yes
+WizardStyle=modern dynamic
 PrivilegesRequired=lowest
 UsePreviousAppDir=yes
 DisableDirPage=yes
@@ -36,9 +37,6 @@ UninstallDisplayIcon={app}\{#MyExe}
 
 [Files]
 Source: "..\target\{#MyTarget}\release\{#MyExe}"; DestDir: "{app}"; Flags: ignoreversion
-
-[Registry]
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Flags: preservestringtype uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#MyExe}"; Description: "Run {#MyAppName}"; Flags: nowait postinstall skipifsilent
@@ -66,11 +64,60 @@ begin
   end;
 end;
 
+const
+  EnvironmentKey = 'Environment';
+
+procedure EnvAddPath(Path: string);
+var
+  Paths: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', Paths) then
+    Paths := '';
+
+  if Pos(';' + Path + ';', ';' + Paths + ';') = 0 then
+  begin
+    if Paths = '' then
+      Paths := Path
+    else
+      Paths := Paths + ';' + Path;
+
+    RegWriteStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', Paths);
+  end;
+end;
+
+procedure EnvRemovePath(Path: string);
+var
+  Paths: string;
+  P: Integer;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', Paths) then exit;
+
+  Paths := ';' + Paths + ';';
+
+  P := Pos(';' + Path + ';', Paths);
+  if P > 0 then
+  begin
+    Delete(Paths, P + 1, Length(Path) + 1);
+
+    if Length(Paths) < 2 then
+      Paths := ''
+    else
+      Paths := Copy(Paths, 2, Length(Paths) - 2);
+
+    RegWriteStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', Paths);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   DownloadPath: String;
 begin
+  if (CurStep = ssPostInstall) then
+  begin
+    EnvAddPath(ExpandConstant('{app}'));
+  end;
+
   if (CurStep = ssPostInstall) and VCRedistNeedsInstall then
   begin
     if MsgBox('This application requires the Microsoft Visual C++ Redistributable (x64). Download and install it now?', mbConfirmation, MB_YESNO) = IDYES then
@@ -84,5 +131,13 @@ begin
         MsgBox('Error downloading or installing Visual C++ Redistributable: ' + GetExceptionMessage, mbError, MB_OK);
       end;
     end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    EnvRemovePath(ExpandConstant('{app}'));
   end;
 end;

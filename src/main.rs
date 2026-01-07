@@ -397,16 +397,27 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                 .and_then(|o| o.get("title"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown Track");
+            let artist = first.and_then(|o| o.get("artist")).and_then(|v| v.as_str());
+
+            let display_title = if let Some(a) = artist {
+                format!("{} by {}", title, a)
+            } else {
+                title.to_string()
+            };
 
             if count > 1 {
                 Some(format!(
                     "{} Added {} tracks to queue (starting with {})",
                     "🎶".cyan(),
                     count,
-                    title.bold()
+                    display_title.bold()
                 ))
             } else {
-                Some(format!("{} Added {} to queue", "🎶".cyan(), title.bold()))
+                Some(format!(
+                    "{} Added {} to queue",
+                    "🎶".cyan(),
+                    display_title.bold()
+                ))
             }
         }
         "skip" => {
@@ -415,7 +426,17 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                     .get("title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown Track");
-                Some(format!("{} Skipped {}", "⏭️".magenta(), title.bold()))
+                let artist = skipped.get("artist").and_then(|v| v.as_str());
+                let display_title = if let Some(a) = artist {
+                    format!("{} by {}", title, a)
+                } else {
+                    title.to_string()
+                };
+                Some(format!(
+                    "{} Skipped {}",
+                    "⏭️".magenta(),
+                    display_title.bold()
+                ))
             } else {
                 Some(format!("{} Nothing to skip", "ℹ️".blue()))
             }
@@ -445,7 +466,13 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                     .get("title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
-                output.push_str(&format!("{} {}\n", "▶️".green(), title.bold()));
+                let artist = curr.get("artist").and_then(|v| v.as_str());
+                let display_title = if let Some(a) = artist {
+                    format!("{} by {}", title, a)
+                } else {
+                    title.to_string()
+                };
+                output.push_str(&format!("{} {}\n", "▶️".green(), display_title.bold()));
             } else {
                 output.push_str("Nothing playing currently.\n");
             }
@@ -458,7 +485,13 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                             .get("title")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown");
-                        output.push_str(&format!("{}. {}\n", i + 1, title));
+                        let artist = item.get("artist").and_then(|v| v.as_str());
+                        let display_title = if let Some(a) = artist {
+                            format!("{} by {}", title, a)
+                        } else {
+                            title.to_string()
+                        };
+                        output.push_str(&format!("{}. {}\n", i + 1, display_title));
                     }
                     if total > list.len() as u64 {
                         output.push_str(&format!("... and {} more\n", total - list.len() as u64));
@@ -484,6 +517,14 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                     .and_then(|t| t.get("title"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
+                let artist = track.and_then(|t| t.get("artist")).and_then(|v| v.as_str());
+
+                let display_title = if let Some(a) = artist {
+                    format!("{} by {}", title, a)
+                } else {
+                    title.to_string()
+                };
+
                 let elapsed = np.get("elapsedMs").and_then(|v| v.as_u64()).unwrap_or(0);
                 let duration = np.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -506,7 +547,7 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                 Some(format!(
                     "{} {}\n{} {}",
                     "▶️".green(),
-                    title.bold(),
+                    display_title.bold(),
                     progress,
                     time_str
                 ))
