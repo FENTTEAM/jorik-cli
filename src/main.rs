@@ -4,15 +4,17 @@ use colored::Colorize;
 use dirs::config_dir;
 use open::that;
 use reqwest::{Client, Url};
-use serde::Serialize;
-use std::fs;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 /// CLI to interact with the Jorik webhook server.
 #[derive(Parser, Debug)]
-#[command(name = "jorik", author, version, about)]
+#[command(name = "jorik CLI", author, version, about)]
 struct Cli {
     /// Base URL of the webhook server
     #[arg(
@@ -127,8 +129,29 @@ enum Commands {
         #[arg(long)]
         user_id: Option<String>,
     },
+    /// Apply audio filters (clear, bassboost, nightcore, vaporwave, 8d, soft, tremolo, vibrato, karaoke)
+    Filter {
+        /// Filter style
+        style: String,
+        #[arg(long)]
+        guild_id: Option<String>,
+        #[arg(long)]
+        user_id: Option<String>,
+    },
     /// Login to get a token
     Login,
+}
+
+#[derive(Deserialize, Clone)]
+struct GiteaAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GiteaRelease {
+    tag_name: String,
+    assets: Vec<GiteaAsset>,
 }
 
 #[derive(Serialize)]
@@ -174,14 +197,165 @@ struct TwentyFourSevenPayload {
     enabled: Option<bool>,
 }
 
+#[derive(Serialize)]
+struct FilterPayload {
+    action: &'static str,
+    guild_id: Option<String>,
+    user_id: Option<String>,
+    filters: AudioFilters,
+}
+
+#[derive(Serialize, Default, Clone)]
+struct AudioFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    equalizer: Option<Vec<EqualizerBand>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    karaoke: Option<KaraokeOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timescale: Option<TimescaleOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tremolo: Option<TremoloOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vibrato: Option<VibratoOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation: Option<RotationOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distortion: Option<DistortionOptions>,
+    #[serde(rename = "channelMix", skip_serializing_if = "Option::is_none")]
+    channel_mix: Option<ChannelMixOptions>,
+    #[serde(rename = "lowPass", skip_serializing_if = "Option::is_none")]
+    low_pass: Option<LowPassOptions>,
+}
+
+#[derive(Serialize, Clone)]
+struct EqualizerBand {
+    band: i32,
+    gain: f32,
+}
+
+#[derive(Serialize, Clone)]
+struct KaraokeOptions {
+    level: Option<f32>,
+    #[serde(rename = "monoLevel")]
+    mono_level: Option<f32>,
+    #[serde(rename = "filterBand")]
+    filter_band: Option<f32>,
+    #[serde(rename = "filterWidth")]
+    filter_width: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct TimescaleOptions {
+    speed: Option<f32>,
+    pitch: Option<f32>,
+    rate: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct TremoloOptions {
+    frequency: Option<f32>,
+    depth: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct VibratoOptions {
+    frequency: Option<f32>,
+    depth: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct RotationOptions {
+    #[serde(rename = "rotationHz")]
+    rotation_hz: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct DistortionOptions {
+    #[serde(rename = "sinOffset")]
+    sin_offset: Option<f32>,
+    #[serde(rename = "sinScale")]
+    sin_scale: Option<f32>,
+    #[serde(rename = "cosOffset")]
+    cos_offset: Option<f32>,
+    #[serde(rename = "cosScale")]
+    cos_scale: Option<f32>,
+    #[serde(rename = "tanOffset")]
+    tan_offset: Option<f32>,
+    #[serde(rename = "tanScale")]
+    tan_scale: Option<f32>,
+    offset: Option<f32>,
+    scale: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct ChannelMixOptions {
+    #[serde(rename = "leftToLeft")]
+    left_to_left: Option<f32>,
+    #[serde(rename = "leftToRight")]
+    left_to_right: Option<f32>,
+    #[serde(rename = "rightToLeft")]
+    right_to_left: Option<f32>,
+    #[serde(rename = "rightToRight")]
+    right_to_right: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+struct LowPassOptions {
+    smoothing: Option<f32>,
+}
+
+async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)> {
+    let url = "https://git.xserv.pp.ua/api/v1/repos/xxanqw/jorik-cli/releases";
+    let res = client
+        .get(url)
+        .header("User-Agent", "jorik-cli")
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+
+    if !res.status().is_success() {
+        return None;
+    }
+
+    let releases: Vec<GiteaRelease> = res.json().await.ok()?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+
+    let mut latest_version = current.clone();
+    let mut update_found = false;
+    let mut latest_release_info = None;
+
+    for release in releases {
+        let clean_name = release.tag_name.trim_start_matches('v');
+        if let Ok(version) = Version::parse(clean_name) {
+            if version > latest_version {
+                latest_version = version;
+                latest_release_info = Some((release.tag_name, release.assets));
+                update_found = true;
+            }
+        }
+    }
+
+    if update_found {
+        latest_release_info
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("jorik-cli/0.2.0")
+        .user_agent("jorik-cli")
+        .timeout(Duration::from_secs(10))
         .build()
         .context("building HTTP client")?;
+
+    let update_client = client.clone();
+    let update_check = tokio::spawn(async move { check_for_updates(&update_client).await });
 
     let token = cli.token.clone().or_else(load_token);
 
@@ -302,6 +476,176 @@ async fn main() -> Result<()> {
         }
         Commands::Login => {
             login(&cli.base_url).await?;
+        }
+        Commands::Filter {
+            style,
+            guild_id,
+            user_id,
+        } => {
+            let filters = match style.to_lowercase().as_str() {
+                "clear" => AudioFilters::default(),
+                "bassboost" => AudioFilters {
+                    equalizer: Some(vec![
+                        EqualizerBand { band: 0, gain: 0.2 },
+                        EqualizerBand {
+                            band: 1,
+                            gain: 0.15,
+                        },
+                        EqualizerBand { band: 2, gain: 0.1 },
+                        EqualizerBand {
+                            band: 3,
+                            gain: 0.05,
+                        },
+                        EqualizerBand { band: 4, gain: 0.0 },
+                        EqualizerBand {
+                            band: 5,
+                            gain: -0.05,
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                "soft" => AudioFilters {
+                    low_pass: Some(LowPassOptions {
+                        smoothing: Some(20.0),
+                    }),
+                    ..Default::default()
+                },
+                "nightcore" => AudioFilters {
+                    timescale: Some(TimescaleOptions {
+                        speed: Some(1.1),
+                        pitch: Some(1.1),
+                        rate: Some(1.0),
+                    }),
+                    ..Default::default()
+                },
+                "vaporwave" => AudioFilters {
+                    timescale: Some(TimescaleOptions {
+                        speed: Some(0.85),
+                        pitch: Some(0.8),
+                        rate: Some(1.0),
+                    }),
+                    ..Default::default()
+                },
+                "8d" => AudioFilters {
+                    rotation: Some(RotationOptions {
+                        rotation_hz: Some(0.2),
+                    }),
+                    ..Default::default()
+                },
+                "tremolo" => AudioFilters {
+                    tremolo: Some(TremoloOptions {
+                        frequency: Some(2.0),
+                        depth: Some(0.5),
+                    }),
+                    ..Default::default()
+                },
+                "vibrato" => AudioFilters {
+                    vibrato: Some(VibratoOptions {
+                        frequency: Some(2.0),
+                        depth: Some(0.5),
+                    }),
+                    ..Default::default()
+                },
+                "karaoke" => AudioFilters {
+                    karaoke: Some(KaraokeOptions {
+                        level: Some(1.0),
+                        mono_level: Some(1.0),
+                        filter_band: Some(220.0),
+                        filter_width: Some(100.0),
+                    }),
+                    ..Default::default()
+                },
+                _ => {
+                    eprintln!("Unknown filter style: {}", style);
+                    return Ok(());
+                }
+            };
+
+            let payload = FilterPayload {
+                action: "filter",
+                guild_id,
+                user_id,
+                filters,
+            };
+            post_audio(&client, &cli.base_url, token.as_deref(), &payload).await?;
+        }
+    }
+
+    if let Ok(Some((latest, assets))) = update_check.await {
+        println!(
+            "\n{} {} -> {}",
+            "A new version of jorik-cli is available:".yellow().bold(),
+            env!("CARGO_PKG_VERSION").red(),
+            latest.green().bold()
+        );
+
+        print!("Do you want to update and install the latest version? [y/N]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if input.trim().eq_ignore_ascii_case("y") {
+            if cfg!(target_os = "linux") {
+                println!("Running update script...");
+                let status = Command::new("sh")
+                    .arg("-c")
+                    .arg("curl -sL https://shorty.pp.ua/jorikcli | bash")
+                    .status()
+                    .context("Failed to execute update script")?;
+
+                if status.success() {
+                    println!(
+                        "\n{}",
+                        "Update successful! You can now use the latest version."
+                            .green()
+                            .bold()
+                    );
+                } else {
+                    println!("\n{}", "Update failed.".red().bold());
+                }
+            } else if cfg!(target_os = "windows") {
+                if let Some(asset) = assets.iter().find(|a| a.name.ends_with("setup.exe")) {
+                    println!("Downloading installer...");
+                    let temp_dir = std::env::temp_dir();
+                    let installer_path = temp_dir.join(&asset.name);
+
+                    {
+                        let mut file = File::create(&installer_path)?;
+                        let mut response = client.get(&asset.browser_download_url).send().await?;
+
+                        if !response.status().is_success() {
+                            bail!("Failed to download installer: {}", response.status());
+                        }
+
+                        while let Some(chunk) = response.chunk().await? {
+                            file.write_all(&chunk)?;
+                        }
+                    }
+
+                    println!("Running installer...");
+                    Command::new(&installer_path)
+                        .arg("/SILENT")
+                        .spawn()
+                        .context("Failed to start installer")?;
+
+                    println!(
+                        "\n{}",
+                        "Update started! The application will now exit to complete the installation."
+                            .green()
+                            .bold()
+                    );
+                    std::process::exit(0);
+                } else {
+                    println!("{}", "No Windows installer found for this release.".red());
+                    println!(
+                        "Download it manually at: https://git.xserv.pp.ua/xxanqw/jorik-cli/releases"
+                    );
+                }
+            } else {
+                println!("Automatic updates are not supported on this platform.");
+                println!("Download it at: https://git.xserv.pp.ua/xxanqw/jorik-cli/releases");
+            }
         }
     }
 
