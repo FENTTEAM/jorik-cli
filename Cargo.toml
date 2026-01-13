@@ -16,5 +16,14 @@ tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
 dirs = "5.0"
 open = "5.1"
 
+# image/graphics rendering dependencies for --version logo
+image = "0.25"
+base64 = "0.21"
+icy_sixel = "0.4"
+terminal_size = "0.3"
+ratatui-image = { version = "10.0.2", default-features = false, features = ["image-defaults", "crossterm"] }
+ratatui = "0.30"
+atty = "0.2"
+
 [build-dependencies]
 winres = "0.1"

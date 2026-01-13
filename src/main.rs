@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+mod ascii;
+mod image;
+
 /// CLI to interact with the Jorik webhook server.
 #[derive(Parser, Debug)]
 #[command(name = "jorik CLI", author, version, about)]
@@ -361,6 +364,36 @@ async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)>
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // If user requested --version/-V, print enhanced version info and exit early.
+    {
+        let args: Vec<_> = std::env::args_os().collect();
+        let mut want_version = false;
+        let mut want_protocols = false;
+        for a in &args {
+            if let Some(s) = a.to_str() {
+                if s == "-V" || s == "--version" {
+                    want_version = true;
+                }
+                if s == "-p" || s == "--protocols" {
+                    want_protocols = true;
+                }
+                if s.starts_with('-') && !s.starts_with("--") {
+                    let short = &s[1..];
+                    if short.contains('V') {
+                        want_version = true;
+                    }
+                    if short.contains('p') {
+                        want_protocols = true;
+                    }
+                }
+            }
+        }
+        if want_version {
+            image::print_version_info(want_protocols);
+            std::process::exit(0);
+        }
+    }
+
     let cli = Cli::parse();
     let client = Client::builder()
         .user_agent("jorik-cli")
@@ -1050,3 +1083,7 @@ fn clean_query(input: &str) -> String {
     }
     input.to_string()
 }
+
+// Image and terminal graphics helpers have been moved into the `image` module
+// (see `src/image.rs`). This keeps `main.rs` focused on CLI logic and delegates
+// detection, encoding and printing of the embedded logo to that module.
