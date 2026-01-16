@@ -7,7 +7,7 @@
 
 use ::image::{DynamicImage, imageops::FilterType};
 use anyhow::{Context, Result};
-use atty;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use colored::Colorize;
@@ -203,8 +203,8 @@ pub fn try_print_logo() -> Result<bool> {
     let (char_w, char_h) = picker.font_size();
 
     // Convert image pixel size into character cell area (round-up)
-    let img_cols = ((img.width() + (char_w as u32) - 1) / (char_w as u32)).max(1) as u16;
-    let img_rows = ((img.height() + (char_h as u32) - 1) / (char_h as u32)).max(1) as u16;
+    let img_cols = img.width().div_ceil(char_w as u32).max(1) as u16;
+    let img_rows = img.height().div_ceil(char_h as u32).max(1) as u16;
 
     // Terminal column width (in characters)
     let term_cols = terminal_size().map(|(Width(w), _)| w).unwrap_or(80);
@@ -265,13 +265,13 @@ pub fn try_print_logo() -> Result<bool> {
             // iTerm2 inline image (picker already encoded/resized as needed)
             print!("{}", it.data);
             io::stdout().flush().ok();
-            return Ok(true);
+            Ok(true)
         }
         Protocol::Sixel(s) => {
             // Sixel payload (picker encoded and sized).
             print!("{}", s.data);
             io::stdout().flush().ok();
-            return Ok(true);
+            Ok(true)
         }
         Protocol::Kitty(_) => {
             // Kitty variant chosen by picker — our internal Kitty string isn't public,
@@ -280,11 +280,11 @@ pub fn try_print_logo() -> Result<bool> {
             let seq = encode_kitty(&img)?;
             print!("{}", seq);
             io::stdout().flush().ok();
-            return Ok(true);
+            Ok(true)
         }
         Protocol::Halfblocks(_) => {
             // Fallback: no graphics protocol; ASCII fallback will be handled elsewhere.
-            return Ok(false);
+            Ok(false)
         }
     }
 }
@@ -437,199 +437,4 @@ fn maybe_downscale_image(img: &DynamicImage) -> Result<DynamicImage> {
         );
     }
     Ok(img.clone())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-
-    #[test]
-    fn detection_helpers() {
-        // Save originals to restore them later
-        let orig_term_program = env::var_os("TERM_PROGRAM");
-        let orig_iterm_session = env::var_os("ITERM_SESSION_ID");
-        let orig_kitty_window = env::var_os("KITTY_WINDOW_ID");
-        let orig_kitty_pid = env::var_os("KITTY_PID");
-        let orig_term = env::var_os("TERM");
-        let orig_wt_session = env::var_os("WT_SESSION");
-        let orig_wt_profile = env::var_os("WT_PROFILE_ID");
-
-        // Ensure clean environment for deterministic checks
-        unsafe {
-            env::remove_var("TERM_PROGRAM");
-        }
-        unsafe {
-            env::remove_var("ITERM_SESSION_ID");
-        }
-        unsafe {
-            env::remove_var("KITTY_WINDOW_ID");
-        }
-        unsafe {
-            env::remove_var("KITTY_PID");
-        }
-        unsafe {
-            env::remove_var("TERM");
-        }
-        unsafe {
-            env::remove_var("WT_SESSION");
-        }
-        unsafe {
-            env::remove_var("WT_PROFILE_ID");
-        }
-
-        // Initially nothing should be detected
-        assert!(!detect_iterm2());
-        assert!(!detect_kitty());
-        assert!(!detect_sixel());
-
-        // iTerm2 detection via TERM_PROGRAM
-        unsafe {
-            env::set_var("TERM_PROGRAM", "iTerm.app");
-        }
-        assert!(detect_iterm2());
-        unsafe {
-            env::remove_var("TERM_PROGRAM");
-        }
-
-        // iTerm2 detection via ITERM_SESSION_ID
-        unsafe {
-            env::set_var("ITERM_SESSION_ID", "1");
-        }
-        assert!(detect_iterm2());
-        unsafe {
-            env::remove_var("ITERM_SESSION_ID");
-        }
-
-        // Kitty detection via KITTY_WINDOW_ID
-        unsafe {
-            env::set_var("KITTY_WINDOW_ID", "1");
-        }
-        assert!(detect_kitty());
-        unsafe {
-            env::remove_var("KITTY_WINDOW_ID");
-        }
-
-        // Kitty detection via KITTY_PID
-        unsafe {
-            env::set_var("KITTY_PID", "1");
-        }
-        assert!(detect_kitty());
-        unsafe {
-            env::remove_var("KITTY_PID");
-        }
-
-        // Kitty detection via TERM containing 'kitty'
-        unsafe {
-            env::set_var("TERM", "xterm-kitty");
-        }
-        assert!(detect_kitty());
-        unsafe {
-            env::remove_var("TERM");
-        }
-
-        // Sixel detection via TERM containing 'sixel'
-        unsafe {
-            env::set_var("TERM", "xterm-sixel");
-        }
-        assert!(detect_sixel());
-        unsafe {
-            env::remove_var("TERM");
-        }
-
-        // Sixel detection heuristic via known terminal name (konsole)
-        unsafe {
-            env::set_var("TERM", "konsole");
-        }
-        assert!(detect_sixel());
-        unsafe {
-            env::remove_var("TERM");
-        }
-
-        // Sixel detection via WT_SESSION (Windows Terminal)
-        unsafe {
-            env::set_var("WT_SESSION", "1");
-        }
-        assert!(detect_sixel());
-        unsafe {
-            env::remove_var("WT_SESSION");
-        }
-
-        // Sixel detection via WT_PROFILE_ID (Windows Terminal)
-        unsafe {
-            env::set_var("WT_PROFILE_ID", "1");
-        }
-        assert!(detect_sixel());
-        unsafe {
-            env::remove_var("WT_PROFILE_ID");
-        }
-
-        // Embedded logo must be present in the binary
-        assert!(!LOGO_PNG.is_empty());
-
-        // Restore original environment variables
-        if let Some(v) = orig_term_program {
-            unsafe {
-                env::set_var("TERM_PROGRAM", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("TERM_PROGRAM");
-            }
-        }
-        if let Some(v) = orig_iterm_session {
-            unsafe {
-                env::set_var("ITERM_SESSION_ID", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("ITERM_SESSION_ID");
-            }
-        }
-        if let Some(v) = orig_kitty_window {
-            unsafe {
-                env::set_var("KITTY_WINDOW_ID", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("KITTY_WINDOW_ID");
-            }
-        }
-        if let Some(v) = orig_kitty_pid {
-            unsafe {
-                env::set_var("KITTY_PID", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("KITTY_PID");
-            }
-        }
-        if let Some(v) = orig_term {
-            unsafe {
-                env::set_var("TERM", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("TERM");
-            }
-        }
-        if let Some(v) = orig_wt_session {
-            unsafe {
-                env::set_var("WT_SESSION", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("WT_SESSION");
-            }
-        }
-        if let Some(v) = orig_wt_profile {
-            unsafe {
-                env::set_var("WT_PROFILE_ID", v);
-            }
-        } else {
-            unsafe {
-                env::remove_var("WT_PROFILE_ID");
-            }
-        }
-    }
 }

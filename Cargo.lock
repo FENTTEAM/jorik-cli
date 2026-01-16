@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "jorik-cli"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -1487,6 +1487,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "terminal_size",
  "tokio",
  "winres",

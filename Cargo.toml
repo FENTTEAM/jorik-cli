@@ -1,6 +1,6 @@
 [package]
 name = "jorik-cli"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -27,3 +27,6 @@ atty = "0.2"
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+tempfile = "3.5"
