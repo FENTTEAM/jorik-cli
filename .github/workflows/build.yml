@@ -1,6 +1,12 @@
 name: build
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-linux:
@@ -24,7 +30,7 @@ jobs:
           mkdir -p dist
           cp "$OUT" "dist/jorik"
           tar -C dist -czf "dist/jorik-${{ env.TARGET }}.tar.gz" "jorik"
-      - uses: christopherhx/gitea-upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN_NAME }}-${{ env.TARGET }}
           path: dist/*
@@ -38,27 +44,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Add cargo bin to PATH
-        shell: pwsh
-        run: |
-          $candidates = @(
-            "$env:USERPROFILE\.cargo\bin",
-            "C:\Users\Docker\.cargo\bin",
-            "C:\Users\Docker\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin",
-            "C:\Program Files\Rust stable MSVC 1.0\bin",
-            "C:\Program Files\Rust stable GNU 1.0\bin",
-            "C:\Rust\.cargo\bin"
-          )
-          foreach ($p in $candidates) {
-            if (Test-Path (Join-Path $p "cargo.exe")) {
-              Add-Content $env:GITHUB_PATH $p
-              break
-            }
-          }
-
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ runner.os }}-${{ env.TARGET }}
+      
+      - name: Install Inno Setup
+        run: choco install innosetup
 
       - name: Get version
         shell: pwsh
@@ -70,8 +62,6 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          $env:PATH = "C:\Users\Docker\.cargo\bin;C:\Users\Docker\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-          if (Get-Command rustup -ErrorAction SilentlyContinue) { rustup default stable }
           cargo build --release --target ${{ env.TARGET }}
 
       - name: Package binary (zip)
@@ -87,9 +77,9 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item "target\${{ env.TARGET }}\release\jorik-cli.exe" "target\${{ env.TARGET }}\release\jorik.exe" -Force
-          iscc /DMyAppVersion=${{ env.VERSION }} /DMyTarget=${{ env.TARGET }} installer\jorik-cli.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ env.VERSION }} /DMyTarget=${{ env.TARGET }} installer\jorik-cli.iss
 
-      - uses: christopherhx/gitea-upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN_NAME }}-${{ env.TARGET }}
           path: dist/*
@@ -99,8 +89,7 @@ jobs:
       - build-linux
       - build-windows
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
 
     steps:
       - uses: actions/checkout@v4
@@ -110,19 +99,29 @@ jobs:
         run: |
           VERSION=$(grep "^version" Cargo.toml | head -n 1 | cut -d '"' -f 2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          
+          # Check if version ends with -{letter} (single letter) or basically any pre-release suffix
+          if [[ "$VERSION" =~ -[a-zA-Z]$ ]]; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          elif [[ "$VERSION" == *"-"* ]]; then
+             # Broader catch for things like -alpha, -beta if needed, but strict request was -{letter}
+             # strict interpretation: 0.4.0-a
+             echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+          fi
 
-      - uses: christopherhx/gitea-download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: akkuman/gitea-release-action@v1
+      - uses: softprops/action-gh-release@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.get_version.outputs.tag }}
-          name: Release v${{ env.VERSION }}
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
             artifacts/*setup.exe
+          prerelease: ${{ env.IS_PRERELEASE }}
+          name: Release v${{ env.VERSION }}
+          generate_release_notes: true
