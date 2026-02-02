@@ -13,7 +13,11 @@ use reqwest::Client;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+
 
 // Approx color from the logo
 const JORIK_PURPLE: Color = Color::Rgb(130, 110, 230); // Soft purple/indigo
@@ -31,7 +35,9 @@ enum View {
     Menu,
     Lyrics,
     FilterMenu,
-    AuthInfo,
+    AuthMenu,
+    AuthResult,
+    LoginRequired,
 }
 
 struct App {
@@ -44,6 +50,7 @@ struct App {
     queue: Vec<String>,
     current_track: Option<String>,
     error_message: Option<String>,
+    fatal_error: Option<String>,
     loop_mode: String, // "off", "track", "queue"
     is_loading: bool,
     
@@ -57,6 +64,9 @@ struct App {
     filter_state: ListState,
     filter_items: Vec<&'static str>,
     
+    auth_menu_state: ListState,
+    auth_menu_items: Vec<&'static str>,
+
     lyrics_text: Option<String>,
     lyrics_scroll: u16,
     
@@ -76,7 +86,12 @@ impl App {
         
         let mut filter_state = ListState::default();
         filter_state.select(Some(0));
+
+        let mut auth_menu_state = ListState::default();
+        auth_menu_state.select(Some(0));
         
+        let view = if token.is_some() { View::Main } else { View::LoginRequired };
+
         Self {
             client,
             base_url,
@@ -86,23 +101,26 @@ impl App {
             queue: Vec::new(),
             current_track: None,
             error_message: None,
+            fatal_error: None,
             loop_mode: "off".to_string(),
             is_loading: false,
             input: String::new(),
             input_mode: InputMode::Normal,
-            view: View::Main,
+            view,
             menu_state,
             menu_items: vec![
                 "Skip", "Pause/Resume", "Stop", "Shuffle", 
                 "Clear Queue", "Loop Track", "Loop Queue", "Loop Off",
                 "24/7 Mode Toggle", "Filters...", "Lyrics", "Play Turip",
-                "Auth Info", "Exit TUI"
+                "Auth", "Exit TUI"
             ],
             filter_state,
             filter_items: vec![
                 "Clear", "Bassboost", "Nightcore", "Vaporwave", 
                 "8D", "Soft", "Tremolo", "Vibrato", "Karaoke"
             ],
+            auth_menu_state,
+            auth_menu_items: vec!["Login", "Signout", "Info"],
             lyrics_text: None,
             lyrics_scroll: 0,
             auth_info_text: None,
@@ -163,10 +181,22 @@ async fn async_fetch_queue(app_arc: Arc<Mutex<App>>) {
                 }
             } else {
                  let text = resp.text().await.unwrap_or_default();
-                 if text.contains("guild_id is required") {
-                     app.error_message = Some("Not connected to a voice channel or Guild ID missing.".to_string());
-                 } else {
-                     app.error_message = Some(format!("Error: {}", text));
+                 
+                 let mut handled = false;
+                 if let Ok(json_err) = serde_json::from_str::<Value>(&text) {
+                     if json_err.get("error").and_then(|v| v.as_str()) == Some("bad_request") &&
+                        json_err.get("message").and_then(|v| v.as_str()) == Some("user_not_in_voice_channel_or_guild_unknown") {
+                            app.fatal_error = Some("User not in voice channel or guild unknown.\n\nPress 'r' to reload.".to_string());
+                            handled = true;
+                     }
+                 }
+
+                 if !handled {
+                     if text.contains("guild_id is required") {
+                         app.error_message = Some("Not connected to a voice channel or Guild ID missing.".to_string());
+                     } else {
+                         app.error_message = Some(format!("Error: {}", text));
+                     }
                  }
             }
         }
@@ -277,6 +307,285 @@ async fn async_simple_command<T: serde::Serialize + Send + Sync + 'static>(app_a
     async_fetch_queue(app_arc).await;
 }
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+async fn async_auth_login(app_arc: Arc<Mutex<App>>) {
+    let (base_url, is_login_required_screen) = {
+        let mut app = app_arc.lock().await;
+        app.is_loading = true;
+        app.auth_info_text = Some("Initializing login...".to_string());
+        
+        let is_login_required = app.view == View::LoginRequired;
+        
+        // If we are NOT on the LoginRequired screen (meaning we are in the Auth Menu), 
+        // switch to AuthResult to show the popup.
+        // If we ARE on LoginRequired, we do NOTHING to the view, staying on that screen.
+        if !is_login_required {
+            app.view = View::AuthResult;
+        }
+        
+        (app.base_url.clone(), is_login_required)
+    };
+
+    let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+        Ok(l) => l,
+        Err(e) => {
+            let mut app = app_arc.lock().await;
+            app.is_loading = false;
+            app.auth_info_text = Some(format!("Failed to bind listener: {}", e));
+            return;
+        }
+    };
+
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            let mut app = app_arc.lock().await;
+            app.is_loading = false;
+            app.auth_info_text = Some(format!("Failed to get local addr: {}", e));
+            return;
+        }
+    };
+
+    let callback_url = format!("http://{}/oauth-callback", local_addr);
+    
+    let mut auth_url = match reqwest::Url::parse(&api::build_url(&base_url, "/authorize")) {
+        Ok(u) => u,
+        Err(e) => {
+            let mut app = app_arc.lock().await;
+            app.is_loading = false;
+            app.auth_info_text = Some(format!("Invalid base URL: {}", e));
+            return;
+        }
+    };
+    
+    auth_url.query_pairs_mut().append_pair("callback", &callback_url);
+
+    {
+        let mut app = app_arc.lock().await;
+        app.auth_info_text = Some(format!("Opening browser...\n\nIf it doesn't open, visit:\n{}", auth_url.as_str()));
+    }
+    
+    let _ = open::that(auth_url.as_str());
+
+    // Wait for callback (120s timeout)
+    match timeout(Duration::from_secs(120), listener.accept()).await {
+        Ok(Ok((mut stream, _addr))) => {
+            let mut buf = vec![0u8; 8192];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let mut app = app_arc.lock().await;
+                    app.is_loading = false;
+                    app.auth_info_text = Some(format!("Error reading callback: {}", e));
+                    return;
+                }
+            };
+            
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let path = first_line.split_whitespace().nth(1).unwrap_or("");
+            
+            // Prepend a scheme+host so `Url::parse` can parse query params.
+            if let Ok(parsed) = reqwest::Url::parse(&format!("http://localhost{}", path)) {
+                let token_pair = parsed.query_pairs().find(|(k, _)| k == "token");
+                let avatar_pair = parsed.query_pairs().find(|(k, _)| k == "avatar");
+                let username_pair = parsed.query_pairs().find(|(k, _)| k == "username");
+                
+                if let Some((_, v)) = token_pair {
+                    let token = v.into_owned();
+                    let token_trim = token.trim().to_string();
+                    if token_trim.is_empty() {
+                        let body = "Missing token";
+                        let resp = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        
+                        let mut app = app_arc.lock().await;
+                        app.is_loading = false;
+                        app.auth_info_text = Some("No token provided in callback.".to_string());
+                        return;
+                    }
+
+                    let avatar_val = avatar_pair.map(|(_, val)| val.into_owned());
+                    let username_val = username_pair.map(|(_, val)| val.into_owned());
+
+                    if let Err(e) = api::save_token(&token_trim, avatar_val.as_deref(), username_val.as_deref()) {
+                        let mut app = app_arc.lock().await;
+                        app.is_loading = false;
+                        app.auth_info_text = Some(format!("Failed to save token: {}", e));
+                        return;
+                    }
+
+                    // Build a small, readable success page and kick off confetti animation.
+                    let escaped_username = username_val
+                        .as_deref()
+                        .map(escape_html)
+                        .unwrap_or_else(|| "User".to_string());
+                    let escaped_avatar = avatar_val.as_deref().map(escape_html);
+                    let saved_path_html = if let Some(path) = api::config_file_path() {
+                        format!(
+                            "<p>Saved to <code>{}</code></p>",
+                            escape_html(&path.display().to_string())
+                        )
+                    } else {
+                        "".to_string()
+                    };
+
+                    let mut body = String::new();
+                    body.push_str(
+                        "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/><title>Authorization complete</title><style>",
+                    );
+                    body.push_str("body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial, sans-serif;background:#2f3136;color:#dcddde;margin:0;padding:0;display:flex;align-items:center;justify-content:center;height:100vh}");
+                    body.push_str(".container{max-width:560px;width:100%;padding:28px;background:#36393f;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.6)}");
+                    body.push_str(
+                        ".header{display:flex;align-items:center;gap:16px;margin-bottom:18px}",
+                    );
+                    body.push_str(".badge{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#2f3136}");
+                    body.push_str(".check{width:34px;height:34px;border-radius:50%;background:#43b581;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px}");
+                    body.push_str(".avatar{width:56px;height:56px;border-radius:50%;object-fit:cover;border:2px solid rgba(0,0,0,0.4)}");
+                    body.push_str(".user{font-size:16px;font-weight:600;margin:0;color:#fff}");
+                    body.push_str(".sp{color:#b9bbbe;font-size:13px;margin-top:4px}");
+                    body.push_str(".path{display:inline-block;background:#2f3136;padding:6px 8px;border-radius:6px;color:#b9bbbe;font-family:monospace;margin-top:8px}");
+                    body.push_str(
+                        "</style></head><body><div class=\"container\"><div class=\"header\">",
+                    );
+                    if let Some(avatar) = &escaped_avatar {
+                        body.push_str(&format!(
+                            r#"<img class="avatar" src="{}" alt="avatar"/>"#,
+                            avatar
+                        ));
+                    } else {
+                        body.push_str(r#"<div class="badge"><div class="check">✓</div></div>"#);
+                    }
+                    body.push_str(&format!(
+                        r#"<div><div class="user">{}</div><div class="sp">Authorization complete</div>{}</div>"#,
+                        escaped_username, saved_path_html
+                    ));
+                    body.push_str(r#"</div><div><p class="sp">Token saved to your config. You may close this window.</p></div>"#);
+
+                    // confetti
+                    body.push_str(r#"<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>"#);
+                    body.push_str(
+                        r#"<script>
+  const duration = 15 * 1000,
+    animationEnd = Date.now() + duration,
+    defaults = { startVelocity: 30, spread: 360, ticks: 60, zIndex: 0 };
+
+  function randomInRange(min, max) {
+    return Math.random() * (max - min) + min;
+  }
+
+  const interval = setInterval(function() {
+    const timeLeft = animationEnd - Date.now();
+
+    if (timeLeft <= 0) {
+      return clearInterval(interval);
+    }
+
+    const particleCount = 50 * (timeLeft / duration);
+
+    confetti(
+      Object.assign({}, defaults, {
+        particleCount,
+        origin: { x: randomInRange(0.1, 0.3), y: Math.random() - 0.2 },
+      })
+    );
+    confetti(
+      Object.assign({}, defaults, {
+        particleCount,
+        origin: { x: randomInRange(0.7, 0.9), y: Math.random() - 0.2 },
+      })
+    );
+  }, 250);
+</script>"#,
+                    );
+                    body.push_str("</div></body></html>");
+
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+
+                    {
+                        let mut app = app_arc.lock().await;
+                        app.is_loading = false;
+                        app.token = Some(token_trim.clone());
+                        app.auth_info_text = Some(format!("Login Successful!\n\nUser: {}\nToken saved.", username_val.unwrap_or_default()));
+                    }
+
+                    // Small delay to ensure stability
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Refresh data before switching view
+                    async_fetch_queue(app_arc.clone()).await;
+
+                    let mut app = app_arc.lock().await;
+                    // Only transition to Main if we were on the LoginRequired screen.
+                    if is_login_required_screen {
+                        app.view = View::Main;
+                    }
+                } else {                    let body = "No token in callback";
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    
+                    let mut app = app_arc.lock().await;
+                    app.is_loading = false;
+                    app.auth_info_text = Some("Login failed: Missing token in callback.".to_string());
+                }
+            }
+        }
+        _ => {
+            let mut app = app_arc.lock().await;
+            app.is_loading = false;
+            app.auth_info_text = Some("Login timed out.".to_string());
+        }
+    }
+}
+
+async fn async_auth_signout(app_arc: Arc<Mutex<App>>) {
+    let (client, base_url, token) = {
+        let mut app = app_arc.lock().await;
+        app.is_loading = true;
+        app.view = View::AuthResult;
+        app.auth_info_text = Some("Signing out...".to_string());
+        (app.client.clone(), app.base_url.clone(), app.token.clone())
+    };
+
+    if let Some(tok) = token {
+        let url = api::build_url(&base_url, "/webhook/auth/revoke");
+        let _ = client.post(&url).bearer_auth(tok).send().await;
+    }
+
+    // Remove local file
+    if let Some(path) = api::config_file_path() {
+        if path.exists() {
+             let _ = std::fs::remove_file(path);
+        }
+    }
+
+    let mut app = app_arc.lock().await;
+    app.is_loading = false;
+    app.token = None;
+    app.auth_info_text = None;
+    app.view = View::LoginRequired;
+}
+
 pub async fn run(
     base_url: String,
     token: Option<String>,
@@ -319,6 +628,16 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     let mut app = app_arc.lock().await;
+
+                    if app.fatal_error.is_some() {
+                        if let KeyCode::Char('r') | KeyCode::Char('к') = key.code {
+                            app.fatal_error = None;
+                            app.error_message = None;
+                            drop(app);
+                            tokio::spawn(async_fetch_queue(app_arc.clone()));
+                        }
+                        continue;
+                    }
                     
                     if app.input_mode == InputMode::Editing {
                         match key.code {
@@ -345,14 +664,14 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                             View::Menu => {
                                 match key.code {
                                     KeyCode::Esc | KeyCode::Tab => app.view = View::Main,
-                                    KeyCode::Down | KeyCode::Char('j') => {
+                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
                                         let i = match app.menu_state.selected() {
                                             Some(i) => if i >= app.menu_items.len() - 1 { 0 } else { i + 1 },
                                             None => 0,
                                         };
                                         app.menu_state.select(Some(i));
                                     }
-                                    KeyCode::Up | KeyCode::Char('k') => {
+                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
                                         let i = match app.menu_state.selected() {
                                             Some(i) => if i == 0 { app.menu_items.len() - 1 } else { i - 1 },
                                             None => 0,
@@ -375,7 +694,46 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                                                 "Filters..." => { app.view = View::FilterMenu; }
                                                 "Lyrics" => { tokio::spawn(async_fetch_lyrics(app_arc.clone())); }
                                                 "Play Turip" => { tokio::spawn(async_play_track(app_arc.clone(), "https://open.spotify.com/track/2RQWB4Asy1rjZL4IUcJ7kn".to_string())); }
-                                                "Auth Info" => { 
+                                                "Auth" => { app.view = View::AuthMenu; }
+                                                "Exit TUI" => return Ok(()),
+                                                _ => {}
+                                            }
+                                            if item != "Filters..." && item != "Lyrics" && item != "Auth" {
+                                                app.view = View::Main;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            },
+                            View::AuthMenu => {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Tab => app.view = View::Main,
+                                    KeyCode::Backspace => app.view = View::Menu,
+                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
+                                        let i = match app.auth_menu_state.selected() {
+                                            Some(i) => if i >= app.auth_menu_items.len() - 1 { 0 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        app.auth_menu_state.select(Some(i));
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
+                                        let i = match app.auth_menu_state.selected() {
+                                            Some(i) => if i == 0 { app.auth_menu_items.len() - 1 } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        app.auth_menu_state.select(Some(i));
+                                    }
+                                    KeyCode::Enter => {
+                                        if let Some(idx) = app.auth_menu_state.selected() {
+                                            match app.auth_menu_items[idx] {
+                                                "Login" => {
+                                                    tokio::spawn(async_auth_login(app_arc.clone()));
+                                                }
+                                                "Signout" => {
+                                                    tokio::spawn(async_auth_signout(app_arc.clone()));
+                                                }
+                                                "Info" => {
                                                     if let Some(auth) = api::load_auth() {
                                                         let mut info = String::new();
                                                         if let Some(path) = api::config_file_path() {
@@ -395,40 +753,46 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                                                         info.push_str(&format!("Token: {}", token_masked));
                                                         
                                                         app.auth_info_text = Some(info);
-                                                        app.view = View::AuthInfo;
+                                                        app.view = View::AuthResult;
                                                     } else {
-                                                        app.auth_info_text = Some("Not authenticated. Run `jorik auth login`.".to_string());
-                                                        app.view = View::AuthInfo;
+                                                        app.auth_info_text = Some("Not authenticated. Run Login.".to_string());
+                                                        app.view = View::AuthResult;
                                                     }
                                                 }
-                                                "Exit TUI" => return Ok(()),
                                                 _ => {}
-                                            }
-                                            if item != "Filters..." && item != "Lyrics" && item != "Auth Info" {
-                                                app.view = View::Main;
                                             }
                                         }
                                     }
                                     _ => {}
                                 }
                             },
-                            View::AuthInfo => {
+                            View::AuthResult => {
                                 match key.code {
-                                    KeyCode::Esc | KeyCode::Enter => app.view = View::Main,
+                                    KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => app.view = View::AuthMenu,
+                                    _ => {}
+                                }
+                            },
+                            View::LoginRequired => {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        tokio::spawn(async_auth_login(app_arc.clone()));
+                                    }
+                                    KeyCode::Char('q') | KeyCode::Char('й') => return Ok(()),
                                     _ => {}
                                 }
                             },
                             View::FilterMenu => {
                                 match key.code {
                                     KeyCode::Esc => app.view = View::Main,
-                                    KeyCode::Down | KeyCode::Char('j') => {
+                                    KeyCode::Backspace => app.view = View::Menu,
+                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
                                         let i = match app.filter_state.selected() {
                                             Some(i) => if i >= app.filter_items.len() - 1 { 0 } else { i + 1 },
                                             None => 0,
                                         };
                                         app.filter_state.select(Some(i));
                                     }
-                                    KeyCode::Up | KeyCode::Char('k') => {
+                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
                                         let i = match app.filter_state.selected() {
                                             Some(i) => if i == 0 { app.filter_items.len() - 1 } else { i - 1 },
                                             None => 0,
@@ -455,10 +819,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                             View::Lyrics => {
                                 match key.code {
                                     KeyCode::Esc => app.view = View::Main,
-                                    KeyCode::Down | KeyCode::Char('j') => {
+                                    KeyCode::Backspace => app.view = View::Menu,
+                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
                                         app.lyrics_scroll = app.lyrics_scroll.saturating_add(1);
                                     },
-                                    KeyCode::Up | KeyCode::Char('k') => {
+                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
                                         app.lyrics_scroll = app.lyrics_scroll.saturating_sub(1);
                                     },
                                     _ => {}
@@ -466,8 +831,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                             },
                             View::Main => {
                                 match key.code {
-                                    KeyCode::Char('q') => return Ok(()),
-                                    KeyCode::Char('r') => {
+                                    KeyCode::Char('q') | KeyCode::Char('й') => return Ok(()),
+                                    KeyCode::Char('r') | KeyCode::Char('к') => {
                                         tokio::spawn(async_fetch_queue(app_arc.clone()));
                                     }
                                     KeyCode::Tab => {
@@ -476,7 +841,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                                     KeyCode::Enter => {
                                         app.input_mode = InputMode::Editing;
                                     }
-                                    KeyCode::Char('l') => {
+                                    KeyCode::Char('l') | KeyCode::Char('д') => {
                                         let new_mode = match app.loop_mode.as_str() {
                                             "off" => "track",
                                             "track" => "queue",
@@ -486,13 +851,13 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                                         app.loop_mode = new_mode.to_string();
                                         tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: new_mode.to_string() }));
                                     }
-                                    KeyCode::Char('s') => {
+                                    KeyCode::Char('s') | KeyCode::Char('ы') | KeyCode::Char('і') => {
                                         tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "skip", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
                                     }
-                                    KeyCode::Char('w') => {
+                                    KeyCode::Char('w') | KeyCode::Char('ц') => {
                                         tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "stop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
                                     }
-                                    KeyCode::Char('c') => {
+                                    KeyCode::Char('c') | KeyCode::Char('с') => {
                                         tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "clear", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
                                     }
                                     KeyCode::Char(c) => {
@@ -557,6 +922,62 @@ fn get_filters_for_style(style: &str) -> AudioFilters {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    if app.view == View::LoginRequired {
+        let area = f.area();
+        f.render_widget(Clear, area);
+        
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(12), // Logo
+                Constraint::Length(2),  // Spacer
+                Constraint::Length(8),  // Text
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        // Logo
+        let art_text: Vec<Line> = ASCII_LOGO.iter().map(|s| Line::from(Span::styled(*s, Style::default().fg(JORIK_PURPLE)))).collect();
+        let art_paragraph = Paragraph::new(art_text)
+            .alignment(Alignment::Center);
+        f.render_widget(art_paragraph, chunks[1]);
+
+        // Text
+        let text = if app.is_loading || (app.auth_info_text.is_some() && app.auth_info_text.as_deref() != Some("Initializing login...")) {
+             let status = app.auth_info_text.clone().unwrap_or_else(|| "Authenticating...".to_string());
+             vec![
+                Line::from(Span::styled("Authenticating...", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))),
+                Line::from(""),
+                Line::from(status),
+             ]
+        } else {
+             vec![
+                Line::from(Span::styled("Authentication Required", Style::default().add_modifier(Modifier::BOLD).fg(Color::Red))),
+                Line::from(""),
+                Line::from("To use Jorik CLI, you must log in with your Discord account."),
+                Line::from("This allows us to access your voice channels and manage playback."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD).fg(JORIK_PURPLE)),
+                    Span::raw(" to Login"),
+                ]),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled("q", Style::default().add_modifier(Modifier::BOLD).fg(JORIK_PURPLE)),
+                    Span::raw(" to Quit"),
+                ]),
+            ]
+        };
+        
+        let p = Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, chunks[3]);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -728,8 +1149,34 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.render_stateful_widget(list, area, &mut app.filter_state);
     }
 
-    // Auth Info Box
-    if app.view == View::AuthInfo {
+    // Auth Menu Box
+    if app.view == View::AuthMenu {
+        let area = centered_rect(40, 40, f.area());
+        f.render_widget(Clear, area);
+        
+        let loading_text = if app.is_loading { " ⏳ " } else { "" };
+        let menu_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(format!(" Auth {} ", loading_text))
+            .title_alignment(Alignment::Center)
+            .border_style(Style::default().fg(JORIK_PURPLE));
+        
+        let items: Vec<ListItem> = app.auth_menu_items
+            .iter()
+            .map(|i| ListItem::new(format!("  {}  ", *i)))
+            .collect();
+            
+        let list = List::new(items)
+            .block(menu_block)
+            .highlight_style(Style::default().bg(JORIK_PURPLE).fg(Color::White).add_modifier(Modifier::BOLD))
+            .highlight_symbol(" ➤ ");
+            
+        f.render_stateful_widget(list, area, &mut app.auth_menu_state);
+    }
+
+    // Auth Result/Info Box
+    if app.view == View::AuthResult {
         let area = centered_rect(60, 40, f.area());
         f.render_widget(Clear, area);
         
@@ -766,6 +1213,28 @@ fn ui(f: &mut Frame, app: &mut App) {
             .block(block)
             .wrap(Wrap { trim: false })
             .scroll((app.lyrics_scroll, 0));
+            
+        f.render_widget(p, area);
+    }
+
+    // Fatal Error Overlay
+    if let Some(msg) = &app.fatal_error {
+        let area = centered_rect(60, 25, f.area());
+        f.render_widget(Clear, area);
+        
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .title(" ⚠ Connection Error ")
+            .title_alignment(Alignment::Center)
+            .style(Style::default())
+            .border_style(Style::default().fg(Color::Red));
+        
+        let p = Paragraph::new(msg.as_str())
+            .block(block)
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
             
         f.render_widget(p, area);
     }
