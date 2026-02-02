@@ -5,18 +5,21 @@ use dirs::config_dir;
 use open::that;
 use reqwest::{Client, Url};
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
+mod api;
 mod ascii;
 mod image;
+mod tui;
+
+use api::*;
 
 /// CLI to interact with the Jorik webhook server.
 #[derive(Parser, Debug)]
@@ -174,6 +177,13 @@ enum Commands {
         #[arg(long)]
         user_id: Option<String>,
     },
+    /// Launch the TUI interface
+    Tui {
+        #[arg(long)]
+        guild_id: Option<String>,
+        #[arg(long)]
+        user_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -186,175 +196,16 @@ enum AuthSubcommand {
     Info,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(serde::Deserialize)]
 struct GiteaAsset {
     name: String,
     browser_download_url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct GiteaRelease {
     tag_name: String,
     assets: Vec<GiteaAsset>,
-}
-
-#[derive(Serialize)]
-struct PlayPayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    channel_id: Option<String>,
-    query: String,
-    user_id: Option<String>,
-    requested_by: Option<String>,
-    avatar_url: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SimplePayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct QueuePayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-    limit: usize,
-    offset: usize,
-}
-
-#[derive(Serialize)]
-struct LoopPayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-    loop_mode: String,
-}
-
-#[derive(Serialize)]
-struct TwentyFourSevenPayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-    enabled: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct FilterPayload {
-    action: &'static str,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-    filters: AudioFilters,
-}
-
-#[derive(Serialize)]
-struct LyricsPayload {
-    action: String,
-    guild_id: Option<String>,
-    user_id: Option<String>,
-}
-
-#[derive(Serialize, Default)]
-struct AudioFilters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    volume: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    equalizer: Option<Vec<EqualizerBand>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    karaoke: Option<KaraokeOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timescale: Option<TimescaleOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tremolo: Option<TremoloOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vibrato: Option<VibratoOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rotation: Option<RotationOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    distortion: Option<DistortionOptions>,
-    #[serde(rename = "channelMix", skip_serializing_if = "Option::is_none")]
-    channel_mix: Option<ChannelMixOptions>,
-    #[serde(rename = "lowPass", skip_serializing_if = "Option::is_none")]
-    low_pass: Option<LowPassOptions>,
-}
-
-#[derive(Serialize, Clone)]
-struct EqualizerBand {
-    band: i32,
-    gain: f32,
-}
-
-#[derive(Serialize, Clone)]
-struct KaraokeOptions {
-    level: Option<f32>,
-    #[serde(rename = "monoLevel")]
-    mono_level: Option<f32>,
-    #[serde(rename = "filterBand")]
-    filter_band: Option<f32>,
-    #[serde(rename = "filterWidth")]
-    filter_width: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct TimescaleOptions {
-    speed: Option<f32>,
-    pitch: Option<f32>,
-    rate: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct TremoloOptions {
-    frequency: Option<f32>,
-    depth: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct VibratoOptions {
-    frequency: Option<f32>,
-    depth: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct RotationOptions {
-    #[serde(rename = "rotationHz")]
-    rotation_hz: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct DistortionOptions {
-    #[serde(rename = "sinOffset")]
-    sin_offset: Option<f32>,
-    #[serde(rename = "sinScale")]
-    sin_scale: Option<f32>,
-    #[serde(rename = "cosOffset")]
-    cos_offset: Option<f32>,
-    #[serde(rename = "cosScale")]
-    cos_scale: Option<f32>,
-    #[serde(rename = "tanOffset")]
-    tan_offset: Option<f32>,
-    #[serde(rename = "tanScale")]
-    tan_scale: Option<f32>,
-    offset: Option<f32>,
-    scale: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct ChannelMixOptions {
-    #[serde(rename = "leftToLeft")]
-    left_to_left: Option<f32>,
-    #[serde(rename = "leftToRight")]
-    left_to_right: Option<f32>,
-    #[serde(rename = "rightToLeft")]
-    right_to_left: Option<f32>,
-    #[serde(rename = "rightToRight")]
-    right_to_right: Option<f32>,
-}
-
-#[derive(Serialize, Clone)]
-struct LowPassOptions {
-    smoothing: Option<f32>,
 }
 
 async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)> {
@@ -429,6 +280,17 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    
+    // Check if we are running TUI first, to avoid printing update checks to stdout
+    if let Commands::Tui { guild_id, user_id } = cli.command {
+        return tui::run(
+            cli.base_url,
+            cli.token.or_else(load_token),
+            guild_id,
+            user_id
+        ).await;
+    }
+
     let client = Client::builder()
         .user_agent("jorik-cli")
         .timeout(Duration::from_secs(10))
@@ -692,6 +554,7 @@ async fn main() -> Result<()> {
             };
             post_audio(&client, &cli.base_url, token.as_deref(), &payload).await?;
         }
+        Commands::Tui { .. } => unreachable!(), // Handled early
     }
 
     if let Ok(Some((latest, assets))) = update_check.await {
@@ -791,7 +654,7 @@ async fn health(client: &Client, base_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn post_audio<T: Serialize>(
+async fn post_audio<T: serde::Serialize>(
     client: &Client,
     base_url: &str,
     token: Option<&str>,
@@ -810,7 +673,7 @@ async fn print_response(resp: reqwest::Response) -> Result<()> {
     let status = resp.status();
     let text = resp.text().await.context("reading response body")?;
 
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+    if let Ok(json) = serde_json::from_str::<Value>(&text) {
         if let Some(summary) = summarize(&json) {
             println!("{}", summary);
         } else if !status.is_success() {
@@ -833,7 +696,7 @@ async fn print_response(resp: reqwest::Response) -> Result<()> {
     Ok(())
 }
 
-fn summarize(json: &serde_json::Value) -> Option<String> {
+fn summarize(json: &Value) -> Option<String> {
     let obj = json.as_object()?;
 
     // Handle Errors
@@ -1010,9 +873,10 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
                 let progress = if duration > 0 {
                     let pct = (elapsed as f64 / duration as f64 * 20.0).round() as usize;
                     let bar = "━".repeat(pct) + "⚪" + &"━".repeat(20usize.saturating_sub(pct));
-                    format!("[{}]", bar)
+                    format!("[{}]
+", bar)
                 } else {
-                    "".to_string()
+                    "\n".to_string()
                 };
 
                 let time_str = format!(
@@ -1089,67 +953,6 @@ fn summarize(json: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn config_file_path() -> Option<PathBuf> {
-    config_dir().map(|p| p.join("jorik-cli").join("auth.json"))
-}
-
-#[derive(Serialize, Deserialize)]
-struct Auth {
-    token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    avatar_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-}
-
-fn save_token(token: &str, avatar_url: Option<&str>, username: Option<&str>) -> Result<()> {
-    let path = config_file_path().context("cannot determine config path")?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("creating config directory")?;
-    }
-
-    let auth = Auth {
-        token: token.trim().to_string(),
-        avatar_url: avatar_url.map(|s| s.to_string()),
-        username: username.map(|s| s.to_string()),
-    };
-
-    let json = serde_json::to_string_pretty(&auth).context("serializing auth")?;
-    fs::write(&path, json).context("writing auth file")?;
-    Ok(())
-}
-
-fn load_auth() -> Option<Auth> {
-    // Try to load the canonical auth.json first.
-    if let Some(path) = config_file_path() {
-        if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(auth) = serde_json::from_str::<Auth>(&contents) {
-                return Some(auth);
-            }
-        }
-    }
-
-    // Legacy raw token files are deprecated and are no longer migrated.
-    // If a legacy token file exists, inform the user and require a fresh
-    // interactive OAuth login (run `jorik auth login`) so that username and
-    // avatar can be captured and stored in auth.json.
-    if let Some(legacy_path) = config_dir().map(|p| p.join("jorik-cli").join("token")) {
-        if legacy_path.exists() {
-            eprintln!(
-                "{}",
-                "Found a legacy token file which is deprecated. Please run `jorik auth login` to re-authenticate; the legacy raw token flow is no longer supported."
-                    .yellow()
-            );
-        }
-    }
-
-    None
-}
-
-fn load_token() -> Option<String> {
-    load_auth().map(|a| a.token)
-}
-
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1165,8 +968,7 @@ async fn login(base_url: &str) -> Result<()> {
         .await
         .context("binding local listener; the legacy manual token-paste flow is deprecated. Please run `jorik auth login` on a device where your browser can redirect to http://127.0.0.1 so the CLI can automatically capture token, avatar and username")?;
     let local_addr = listener
-        .local_addr()
-        .context("getting local listener address")?;
+        .local_addr()?;
     let callback_url = format!("http://{}/oauth-callback", local_addr);
     println!(
         "{} Local callback URL: {}",
@@ -1193,8 +995,7 @@ async fn login(base_url: &str) -> Result<()> {
             let mut buf = vec![0u8; 8192];
             let n = stream
                 .read(&mut buf)
-                .await
-                .context("reading callback request")?;
+                .await?;
             let req = String::from_utf8_lossy(&buf[..n]);
             let first_line = req.lines().next().unwrap_or("");
             let path = first_line.split_whitespace().nth(1).unwrap_or("");
@@ -1238,40 +1039,41 @@ async fn login(base_url: &str) -> Result<()> {
 
                     let mut body = String::new();
                     body.push_str(
-                        "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/><title>Authorization complete</title><style>",
+                        r##"<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Authorization complete</title><style>"##,
                     );
-                    body.push_str("body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial, sans-serif;background:#2f3136;color:#dcddde;margin:0;padding:0;display:flex;align-items:center;justify-content:center;height:100vh}");
-                    body.push_str(".container{max-width:560px;width:100%;padding:28px;background:#36393f;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.6)}");
+                    body.push_str(r##"body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial, sans-serif;background:#2f3136;color:#dcddde;margin:0;padding:0;display:flex;align-items:center;justify-content:center;height:100vh}"##);
+                    body.push_str(r##".container{max-width:560px;width:100%;padding:28px;background:#36393f;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.6)}"##);
                     body.push_str(
-                        ".header{display:flex;align-items:center;gap:16px;margin-bottom:18px}",
+                        r##".header{display:flex;align-items:center;gap:16px;margin-bottom:18px}"##,
                     );
-                    body.push_str(".badge{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#2f3136}");
-                    body.push_str(".check{width:34px;height:34px;border-radius:50%;background:#43b581;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px}");
-                    body.push_str(".avatar{width:56px;height:56px;border-radius:50%;object-fit:cover;border:2px solid rgba(0,0,0,0.4)}");
-                    body.push_str(".user{font-size:16px;font-weight:600;margin:0;color:#fff}");
-                    body.push_str(".sp{color:#b9bbbe;font-size:13px;margin-top:4px}");
-                    body.push_str(".path{display:inline-block;background:#2f3136;padding:6px 8px;border-radius:6px;color:#b9bbbe;font-family:monospace;margin-top:8px}");
+                    body.push_str(r##".badge{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#2f3136}"##);
+                    body.push_str(r##".check{width:34px;height:34px;border-radius:50%;background:#43b581;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px}"##);
+                    body.push_str(r##".avatar{width:56px;height:56px;border-radius:50%;object-fit:cover;border:2px solid rgba(0,0,0,0.4)}"##);
+                    body.push_str(r##".user{font-size:16px;font-weight:600;margin:0;color:#fff}"##);
+                    body.push_str(r##".sp{color:#b9bbbe;font-size:13px;margin-top:4px}"##);
+                    body.push_str(r##".path{display:inline-block;background:#2f3136;padding:6px 8px;border-radius:6px;color:#b9bbbe;font-family:monospace;margin-top:8px}"##);
                     body.push_str(
-                        "</style></head><body><div class=\"container\"><div class=\"header\">",
+                        r##"</style></head><body><div class=\"container\"><div class=\"header\">"##,
                     );
                     if let Some(avatar) = &escaped_avatar {
                         body.push_str(&format!(
-                            r#"<img class="avatar" src="{}" alt="avatar"/>"#,
+                            r##"<img class=\"avatar\" src=\"{}\" alt=\"avatar"##,
                             avatar
                         ));
                     } else {
-                        body.push_str(r#"<div class="badge"><div class="check">✓</div></div>"#);
+                        body.push_str(r##"<div class=\"badge\"><div class=\"check\">✓</div></div>"##);
                     }
                     body.push_str(&format!(
-                        r#"<div><div class="user">{}</div><div class="sp">Authorization complete</div>{}</div>"#,
-                        escaped_username, saved_path_html
+                        r##"<div><div class=\"user\">{}</div><div class=\"sp\">Authorization complete</div>{}"##,
+                        escaped_username,
+                        saved_path_html
                     ));
-                    body.push_str(r#"</div><div><p class="sp">Token saved to your config. You may close this window.</p></div>"#);
+                    body.push_str(r##"</div><div><p class=\"sp\">Token saved to your config. You may close this window.</p></div>"##);
 
                     // confetti
-                    body.push_str(r#"<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>"#);
+                    body.push_str(r##"<script src=\"https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js\"></script>"##);
                     body.push_str(
-                        r#"<script>
+                        r##"<script>
   const duration = 15 * 1000,
     animationEnd = Date.now() + duration,
     defaults = { startVelocity: 30, spread: 360, ticks: 60, zIndex: 0 };
@@ -1302,13 +1104,12 @@ async fn login(base_url: &str) -> Result<()> {
       })
     );
   }, 250);
-</script>"#,
+</script>"##,
                     );
                     body.push_str("</div></body></html>");
 
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
                         body
                     );
                     stream.write_all(resp.as_bytes()).await.ok();
@@ -1317,7 +1118,7 @@ async fn login(base_url: &str) -> Result<()> {
                     if let Some(path) = config_file_path() {
                         println!("{} Token saved to {}", "✔".green(), path.display());
                     }
-                    return Ok(());
+                    return Ok(())
                 }
             }
 
@@ -1424,37 +1225,3 @@ async fn signout(client: &Client, base_url: &str, token: Option<&str>) -> Result
     }
     Ok(())
 }
-
-fn build_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-fn clean_query(input: &str) -> String {
-    if let Ok(mut url) = Url::parse(input) {
-        if url.cannot_be_a_base() || url.query().is_none() {
-            return input.to_string();
-        }
-
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(k, _)| k != "si")
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-
-        if pairs.is_empty() {
-            url.set_query(None);
-        } else {
-            let mut serializer = url.query_pairs_mut();
-            serializer.clear();
-            for (k, v) in pairs {
-                serializer.append_pair(&k, &v);
-            }
-        }
-        return url.to_string();
-    }
-    input.to_string()
-}
-
-// Image and terminal graphics helpers have been moved into the `image` module
-// (see `src/image.rs`). This keeps `main.rs` focused on CLI logic and delegates
-// detection, encoding and printing of the embedded logo to that module.
