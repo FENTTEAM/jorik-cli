@@ -6,9 +6,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap, BarChart, Bar, BarGroup},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap, BarChart, Bar, BarGroup, Gauge, Tabs},
     DefaultTerminal, Frame,
 };
+use ratatui::style::Stylize;
 use reqwest::Client;
 use serde_json::Value;
 use std::{sync::Arc, time::{Duration, Instant}};
@@ -21,6 +22,69 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 
 
+
+// Theme Colors
+struct Theme {
+    bg: Color,
+    border: Color,
+    primary: Color,
+    highlight: Color,
+    text_secondary: Color,
+}
+
+fn get_theme(name: &str) -> Theme {
+    match name {
+        "Midnight" => Theme {
+            bg: Color::Rgb(5, 5, 15),
+            border: Color::Rgb(40, 40, 60),
+            primary: Color::Rgb(100, 100, 255),
+            highlight: Color::Rgb(150, 150, 255),
+            text_secondary: Color::Rgb(120, 120, 140),
+        },
+        "Emerald" => Theme {
+            bg: Color::Rgb(5, 15, 5),
+            border: Color::Rgb(40, 60, 40),
+            primary: Color::Rgb(50, 200, 50),
+            highlight: Color::Rgb(100, 255, 100),
+            text_secondary: Color::Rgb(120, 140, 120),
+        },
+        "Ruby" => Theme {
+            bg: Color::Rgb(15, 5, 5),
+            border: Color::Rgb(60, 40, 40),
+            primary: Color::Rgb(200, 50, 50),
+            highlight: Color::Rgb(255, 100, 100),
+            text_secondary: Color::Rgb(140, 120, 120),
+        },
+        "Ocean" => Theme {
+            bg: Color::Rgb(5, 10, 20),
+            border: Color::Rgb(40, 60, 100),
+            primary: Color::Rgb(50, 150, 255),
+            highlight: Color::Rgb(100, 200, 255),
+            text_secondary: Color::Rgb(120, 130, 160),
+        },
+        "Synthwave" => Theme {
+            bg: Color::Rgb(20, 10, 30),
+            border: Color::Rgb(100, 40, 100),
+            primary: Color::Rgb(255, 50, 255),
+            highlight: Color::Rgb(255, 150, 50), // Orange highlight
+            text_secondary: Color::Rgb(160, 120, 180),
+        },
+        "Sepia" => Theme {
+            bg: Color::Rgb(30, 25, 20),
+            border: Color::Rgb(80, 70, 60),
+            primary: Color::Rgb(180, 140, 100),
+            highlight: Color::Rgb(220, 180, 140),
+            text_secondary: Color::Rgb(140, 130, 120),
+        },
+        _ => Theme { // Default Jorik Purple
+            bg: Color::Rgb(15, 15, 25),
+            border: Color::Rgb(60, 60, 80),
+            primary: JORIK_PURPLE,
+            highlight: JORIK_HIGHLIGHT,
+            text_secondary: Color::Rgb(150, 150, 170),
+        },
+    }
+}
 
 // Approx color from the logo
 const JORIK_PURPLE: Color = Color::Rgb(130, 110, 230); // Soft purple/indigo
@@ -43,12 +107,16 @@ enum View {
     LoginRequired,
     Settings,
     Debug,
+    AppInfo,
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum SettingsField {
     Host,
     Offset,
+    Theme,
+    VizStyle,
+    Layout,
 }
 
 struct App {
@@ -92,13 +160,18 @@ struct App {
 
     settings_input: String,
     offset_input: String,
+    theme: String,
+    viz_style: String,
+    layout: String,
     settings_field: SettingsField,
+    is_settings_editing: bool,
     needs_reconnect: bool,
     visualizer_offset: i64,
 
     debug_logs: Vec<String>,
     ws_connected: bool,
     ws_connecting: bool,
+    ws_sender: Option<tokio::sync::mpsc::UnboundedSender<Message>>,
 
     smoothed_bars: Vec<f32>,
 }
@@ -106,8 +179,7 @@ struct App {
 impl App {
     fn new(
         client: Client,
-        base_url: String,
-        visualizer_offset: i64,
+        settings: api::Settings,
         token: Option<String>,
         guild_id: Option<String>,
         user_id: Option<String>,
@@ -125,7 +197,7 @@ impl App {
 
         Self {
             client,
-            base_url: base_url.clone(),
+            base_url: settings.base_url.clone(),
             token,
             guild_id,
             user_id,
@@ -140,10 +212,10 @@ impl App {
             view,
             menu_state,
             menu_items: vec![
-                "Skip", "Pause/Resume", "Stop", "Shuffle", 
-                "Clear Queue", "Loop Track", "Loop Queue", "Loop Off",
-                "24/7 Mode Toggle", "Filters...", "Lyrics", "Play Turip",
-                "Auth", "Settings", "Exit TUI"
+                " [+] Skip ", " [||] Pause/Resume ", " [X] Stop ", " [/] Shuffle ", 
+                " [C] Clear Queue ", " [T] Loop Track ", " [Q] Loop Queue ", " [.] Loop Off ",
+                " [24/7] Mode Toggle ", " [F] Filters... ", " [L] Lyrics ", " [P] Play Turip ",
+                " [A] Auth ", " [S] Settings ", " [!] Exit TUI "
             ],
             filter_state,
             filter_items: vec![
@@ -160,14 +232,19 @@ impl App {
             duration_ms: 0,
             paused: true,
             last_state_update: Instant::now(),
-            settings_input: base_url,
-            offset_input: visualizer_offset.to_string(),
+            settings_input: settings.base_url.clone(),
+            offset_input: settings.visualizer_offset.to_string(),
+            theme: settings.theme,
+            viz_style: settings.visualizer_style,
+            layout: settings.layout,
             settings_field: SettingsField::Host,
+            is_settings_editing: false,
             needs_reconnect: false,
-            visualizer_offset,
+            visualizer_offset: settings.visualizer_offset,
             debug_logs: Vec::new(),
             ws_connected: false,
             ws_connecting: false,
+            ws_sender: None,
             smoothed_bars: vec![0.0; 64],
         }
     }
@@ -218,6 +295,13 @@ impl App {
     }
 
     fn parse_queue_response(&mut self, json: &Value) {
+        // Handle nested queue object if present
+        let target = if let Some(queue) = json.get("queue") {
+            queue
+        } else {
+            json
+        };
+
         // Capture guild_id if provided by server
         if let Some(gid) = json.get("guild_id").and_then(|v| v.as_str()) {
             if self.guild_id.is_none() {
@@ -231,16 +315,19 @@ impl App {
             self.guild_id = Some(gid.to_string());
         }
 
-        if let Some(current) = json.get("current").and_then(|v| v.as_object()) {
+        if let Some(current) = target.get("current").and_then(|v| v.as_object()) {
             let title = current.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown");
             let author = current.get("author").and_then(|v| v.as_str()).unwrap_or("");
             self.current_track = Some(format!("{} - {}", title, author));
         } else {
-            self.current_track = None;
+            // Only clear current_track if we are sure we are looking at a queue object
+            if target.get("current").is_some() || target.get("upcoming").is_some() {
+                self.current_track = None;
+            }
         }
 
-        self.queue.clear();
-        if let Some(upcoming) = json.get("upcoming").and_then(|v| v.as_array()) {
+        if let Some(upcoming) = target.get("upcoming").and_then(|v| v.as_array()) {
+            self.queue.clear();
             for item in upcoming {
                 let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown");
                 let author = item.get("author").and_then(|v| v.as_str()).unwrap_or("");
@@ -357,7 +444,7 @@ async fn async_fetch_queue(app_arc: Arc<Mutex<App>>) {
 }
 
 async fn async_play_track(app_arc: Arc<Mutex<App>>, query: String) {
-    let (client, url, token, payload) = {
+    let (ws_sender, ws_connected, client, url, token, payload) = {
         let mut app = app_arc.lock().await;
         app.is_loading = true;
         let payload = PlayPayload {
@@ -370,9 +457,31 @@ async fn async_play_track(app_arc: Arc<Mutex<App>>, query: String) {
             avatar_url: None,
         };
         let url = api::build_url(&app.base_url, "/webhook/audio");
-        (app.client.clone(), url, app.token.clone(), payload)
+        (app.ws_sender.clone(), app.ws_connected, app.client.clone(), url, app.token.clone(), payload)
     };
 
+    if ws_connected {
+        if let Some(sender) = ws_sender {
+            let ws_action = api::WsAction {
+                event_type: "action",
+                id: format!("play-{}", chrono::Local::now().timestamp_millis()),
+                payload: &payload,
+            };
+            if let Ok(json) = serde_json::to_string(&ws_action) {
+                if let Ok(_) = sender.send(Message::Text(json.into())) {
+                    // Success sending via WS
+                    // We still set is_loading to false after a bit, or let the WS event handle it.
+                    // Actually, WS event will refresh the queue anyway.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut app = app_arc.lock().await;
+                    app.is_loading = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    // Fallback to REST
     let mut req = client.post(&url).json(&payload);
     if let Some(bearer) = &token {
         req = req.bearer_auth(bearer);
@@ -384,7 +493,7 @@ async fn async_play_track(app_arc: Arc<Mutex<App>>, query: String) {
 }
 
 async fn async_fetch_lyrics(app_arc: Arc<Mutex<App>>) {
-    let (client, url, token, payload) = {
+    let (ws_sender, ws_connected, client, url, token, payload) = {
         let mut app = app_arc.lock().await;
         app.is_loading = true;
         let payload = LyricsPayload {
@@ -393,8 +502,22 @@ async fn async_fetch_lyrics(app_arc: Arc<Mutex<App>>) {
             user_id: app.user_id.clone(),
         };
         let url = api::build_url(&app.base_url, "/webhook/audio");
-        (app.client.clone(), url, app.token.clone(), payload)
+        (app.ws_sender.clone(), app.ws_connected, app.client.clone(), url, app.token.clone(), payload)
     };
+
+    if ws_connected {
+        if let Some(sender) = ws_sender {
+            let ws_action = api::WsAction {
+                event_type: "action",
+                id: format!("lyrics-{}", chrono::Local::now().timestamp_millis()),
+                payload: &payload,
+            };
+            if let Ok(json) = serde_json::to_string(&ws_action) {
+                if let Ok(_) = sender.send(Message::Text(json.into())) {
+                }
+            }
+        }
+    }
 
     let mut req = client.post(&url).json(&payload);
     if let Some(bearer) = &token {
@@ -440,12 +563,30 @@ async fn async_fetch_lyrics(app_arc: Arc<Mutex<App>>) {
 }
 
 async fn async_simple_command<T: serde::Serialize + Send + Sync + 'static>(app_arc: Arc<Mutex<App>>, endpoint: String, payload: T) {
-    let (client, url, token) = {
+    let (ws_sender, ws_connected, client, url, token) = {
         let mut app = app_arc.lock().await;
         app.is_loading = true;
         let url = api::build_url(&app.base_url, &endpoint);
-        (app.client.clone(), url, app.token.clone())
+        (app.ws_sender.clone(), app.ws_connected, app.client.clone(), url, app.token.clone())
     };
+
+    if ws_connected && endpoint.contains("/webhook/audio") {
+        if let Some(sender) = ws_sender {
+            let ws_action = api::WsAction {
+                event_type: "action",
+                id: format!("cmd-{}", chrono::Local::now().timestamp_millis()),
+                payload: &payload,
+            };
+            if let Ok(json) = serde_json::to_string(&ws_action) {
+                if let Ok(_) = sender.send(Message::Text(json.into())) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut app = app_arc.lock().await;
+                    app.is_loading = false;
+                    return;
+                }
+            }
+        }
+    }
 
     let mut req = client.post(&url).json(&payload);
     if let Some(bearer) = &token {
@@ -736,7 +877,7 @@ async fn async_auth_signout(app_arc: Arc<Mutex<App>>) {
     app.view = View::LoginRequired;
 }
 
-async fn spawn_websocket(app_arc: Arc<Mutex<App>>) {
+async fn spawn_websocket(app_arc: Arc<Mutex<App>>, mut ws_rx: tokio::sync::mpsc::UnboundedReceiver<Message>) {
     let mut last_waiting_log = Instant::now();
     
     loop {
@@ -825,6 +966,10 @@ async fn spawn_websocket(app_arc: Arc<Mutex<App>>) {
                                             }
                                             "state_update" | "initial_state" => {
                                                 if event.guild_id.as_deref() == app.guild_id.as_deref() {
+                                                    if let Some(data) = &event.data {
+                                                        app.parse_queue_response(data);
+                                                    }
+
                                                     // Check both root and data.playback for robustness
                                                     let playback = event.playback.clone().or_else(|| {
                                                         event.data.as_ref()
@@ -850,7 +995,7 @@ async fn spawn_websocket(app_arc: Arc<Mutex<App>>) {
                                                     }
                                                 }
                                             }
-                                                                                        "queue_update" => {
+                                            "queue_update" => {
                                                 if event.guild_id.as_deref() == app.guild_id.as_deref() {
                                                     app.log("Received Queue Update");
                                                     if let Some(data) = event.data {
@@ -867,6 +1012,11 @@ async fn spawn_websocket(app_arc: Arc<Mutex<App>>) {
                                                     // Trigger a full REST refresh to get the latest queue state
                                                     tokio::spawn(async_fetch_queue(app_arc.clone()));
                                                 }
+                                            }
+                                            "action_response" => {
+                                                let success = event.success.unwrap_or(false);
+                                                let id = event.id.as_deref().unwrap_or("unknown");
+                                                app.log(format!("WS Action Response [{}]: success={}", id, success));
                                             }
                                             _ => {
                                                 app.log(format!("WS Unhandled Event: {}", event.event_type));
@@ -888,6 +1038,13 @@ async fn spawn_websocket(app_arc: Arc<Mutex<App>>) {
                                     break;
                                 }
                                 _ => {}
+                            }
+                        }
+                        Some(out_msg) = ws_rx.recv() => {
+                            if let Err(e) = ws_stream.send(out_msg).await {
+                                let mut app = app_arc.lock().await;
+                                app.log(format!("WS Send Error: {}", e));
+                                break;
                             }
                         }
                         _ = tokio::time::sleep(Duration::from_millis(500)) => {
@@ -928,11 +1085,16 @@ pub async fn run(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let app = Arc::new(Mutex::new(App::new(client, settings.base_url, settings.visualizer_offset, token, guild_id, user_id)));
+    let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    let mut app_struct = App::new(client, settings, token, guild_id, user_id);
+    app_struct.ws_sender = Some(ws_tx);
+    
+    let app = Arc::new(Mutex::new(app_struct));
     
     // Initial fetch
     tokio::spawn(async_fetch_queue(app.clone()));
-    tokio::spawn(spawn_websocket(app.clone()));
+    tokio::spawn(spawn_websocket(app.clone(), ws_rx));
 
     let app_clone = app.clone();
     tokio::spawn(async move {
@@ -974,326 +1136,458 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                     }
                     
                     if app.input_mode == InputMode::Editing {
-                        match key.code {
-                            KeyCode::Enter => {
-                                let query = app.input.clone();
-                                app.input.clear();
-                                app.input_mode = InputMode::Normal;
-                                tokio::spawn(async_play_track(app_arc.clone(), query));
+                        handle_editing_keys(&mut *app, key, app_arc.clone());
+                        continue;
+                    }
+
+                    if app.is_settings_editing {
+                        handle_settings_keys(&mut *app, key, app_arc.clone());
+                        continue;
+                    }
+
+                    // Global Tab Switching (1-4)
+                    match key.code {
+                        KeyCode::Char('1') => { app.view = View::Main; continue; }
+                        KeyCode::Char('2') => { 
+                            if app.view != View::Lyrics {
+                                tokio::spawn(async_fetch_lyrics(app_arc.clone()));
                             }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                                app.input.clear();
-                            }
-                            KeyCode::Char(c) => {
-                                app.input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                app.input.pop();
-                            }
-                            _ => {}
+                            app.view = View::Lyrics; 
+                            continue; 
                         }
-                    } else {
-                        match app.view {
-                            View::Menu => {
-                                match key.code {
-                                    KeyCode::Esc | KeyCode::Tab => app.view = View::Main,
-                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
-                                        let i = match app.menu_state.selected() {
-                                            Some(i) => if i >= app.menu_items.len() - 1 { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        app.menu_state.select(Some(i));
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
-                                        let i = match app.menu_state.selected() {
-                                            Some(i) => if i == 0 { app.menu_items.len() - 1 } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        app.menu_state.select(Some(i));
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(idx) = app.menu_state.selected() {
-                                            let item = app.menu_items[idx];
-                                            match item {
-                                                "Skip" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "skip", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
-                                                "Pause/Resume" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "pause", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
-                                                "Stop" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "stop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
-                                                "Shuffle" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "shuffle", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
-                                                "Clear Queue" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "clear", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
-                                                "Loop Track" => { app.loop_mode = "track".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "track".to_string() })); }
-                                                "Loop Queue" => { app.loop_mode = "queue".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "queue".to_string() })); }
-                                                "Loop Off" => { app.loop_mode = "off".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "off".to_string() })); }
-                                                "24/7 Mode Toggle" => { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), TwentyFourSevenPayload { action: "247", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), enabled: None })); }
-                                                "Filters..." => { app.view = View::FilterMenu; }
-                                                "Lyrics" => { tokio::spawn(async_fetch_lyrics(app_arc.clone())); }
-                                                "Play Turip" => { tokio::spawn(async_play_track(app_arc.clone(), "https://open.spotify.com/track/2RQWB4Asy1rjZL4IUcJ7kn".to_string())); }
-                                                "Auth" => { app.view = View::AuthMenu; }
-                                                "Settings" => { 
-                                                    app.settings_input = app.base_url.clone();
-                                                    app.view = View::Settings; 
-                                                }
-                                                "Exit TUI" => return Ok(()),
-                                                _ => {}
-                                            }
-                                            if item != "Filters..." && item != "Lyrics" && item != "Auth" && item != "Settings" {
-                                                app.view = View::Main;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            },
-                            View::Settings => {
-                                match key.code {
-                                    KeyCode::Enter => {
-                                        let was_login_required = app.token.is_none();
-                                        let old_host = app.base_url.clone();
-                                        app.base_url = app.settings_input.clone();
-                                        
-                                        if let Ok(offset) = app.offset_input.parse::<i64>() {
-                                            app.visualizer_offset = offset;
-                                        }
+                        KeyCode::Char('3') => { 
+                            app.settings_input = app.base_url.clone();
+                            app.view = View::Settings; 
+                            continue; 
+                        }
+                        KeyCode::Char('4') => { app.view = View::Debug; continue; }
+                        _ => {}
+                    }
 
-                                        if old_host != app.base_url {
-                                            app.needs_reconnect = true;
-                                        }
+                    // Global Quit (q) - except in Settings where it might be typed
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('й')) && app.view != View::Settings {
+                        return Ok(());
+                    }
 
-                                        let settings = api::Settings { 
-                                            base_url: app.base_url.clone(),
-                                            visualizer_offset: app.visualizer_offset,
-                                        };
-                                        let _ = api::save_settings(&settings);
-                                        
-                                        if was_login_required {
-                                            app.view = View::LoginRequired;
-                                        } else {
-                                            app.view = View::Main;
-                                        }
-                                        
-                                        // Refresh data with new host
-                                        tokio::spawn(async_fetch_queue(app_arc.clone()));
-                                    }
-                                    KeyCode::Esc => {
-                                        if app.token.is_none() {
-                                            app.view = View::LoginRequired;
-                                        } else {
-                                            app.view = View::Main;
-                                        }
-                                    }
-                                    KeyCode::Down | KeyCode::Up | KeyCode::Tab => {
-                                        app.settings_field = match app.settings_field {
-                                            SettingsField::Host => SettingsField::Offset,
-                                            SettingsField::Offset => SettingsField::Host,
-                                        };
-                                    }
-                                    KeyCode::Backspace => {
-                                        match app.settings_field {
-                                            SettingsField::Host => { app.settings_input.pop(); }
-                                            SettingsField::Offset => { app.offset_input.pop(); }
-                                        }
-                                    }
-                                    KeyCode::Char(c) => {
-                                        match app.settings_field {
-                                            SettingsField::Host => { app.settings_input.push(c); }
-                                            SettingsField::Offset => { 
-                                                if c.is_ascii_digit() || (c == '-' && app.offset_input.is_empty()) { 
-                                                    app.offset_input.push(c); 
-                                                } 
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            },
-                            View::AuthMenu => {
-                                match key.code {
-                                    KeyCode::Esc | KeyCode::Tab => app.view = View::Main,
-                                    KeyCode::Backspace => app.view = View::Menu,
-                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
-                                        let i = match app.auth_menu_state.selected() {
-                                            Some(i) => if i >= app.auth_menu_items.len() - 1 { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        app.auth_menu_state.select(Some(i));
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
-                                        let i = match app.auth_menu_state.selected() {
-                                            Some(i) => if i == 0 { app.auth_menu_items.len() - 1 } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        app.auth_menu_state.select(Some(i));
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(idx) = app.auth_menu_state.selected() {
-                                            match app.auth_menu_items[idx] {
-                                                "Login" => {
-                                                    tokio::spawn(async_auth_login(app_arc.clone()));
-                                                }
-                                                "Signout" => {
-                                                    tokio::spawn(async_auth_signout(app_arc.clone()));
-                                                }
-                                                "Info" => {
-                                                    if let Some(auth) = api::load_auth() {
-                                                        let mut info = String::new();
-                                                        if let Some(path) = api::config_file_path() {
-                                                            info.push_str(&format!("Auth file: {}\n", path.display()));
-                                                        }
-                                                        info.push_str(&format!("User: {}\n", auth.username.unwrap_or_else(|| "Unknown".to_string())));
-                                                        if let Some(avatar) = auth.avatar_url {
-                                                            info.push_str(&format!("Avatar: {}\n", avatar));
-                                                        } else {
-                                                            info.push_str("Avatar: (none)\n");
-                                                        }
-                                                        let token_masked = if auth.token.len() > 8 {
-                                                            format!("{}...{}", &auth.token[0..4], &auth.token[auth.token.len() - 4..])
-                                                        } else {
-                                                            auth.token
-                                                        };
-                                                        info.push_str(&format!("Token: {}", token_masked));
-                                                        
-                                                        app.auth_info_text = Some(info);
-                                                        app.view = View::AuthResult;
-                                                    } else {
-                                                        app.auth_info_text = Some("Not authenticated. Run Login.".to_string());
-                                                        app.view = View::AuthResult;
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            },
-                            View::AuthResult => {
-                                match key.code {
-                                    KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => app.view = View::AuthMenu,
-                                    _ => {}
-                                }
-                            },
-                            View::LoginRequired => {
-                                match key.code {
-                                    KeyCode::Enter => {
-                                        tokio::spawn(async_auth_login(app_arc.clone()));
-                                    }
-                                    KeyCode::Char('\\') => {
-                                        app.settings_input = app.base_url.clone();
-                                        app.view = View::Settings;
-                                    }
-                                    KeyCode::Char('q') | KeyCode::Char('й') => return Ok(()),
-                                    _ => {}
-                                }
-                            },
-                            View::FilterMenu => {
-                                match key.code {
-                                    KeyCode::Esc => app.view = View::Main,
-                                    KeyCode::Backspace => app.view = View::Menu,
-                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
-                                        let i = match app.filter_state.selected() {
-                                            Some(i) => if i >= app.filter_items.len() - 1 { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        app.filter_state.select(Some(i));
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
-                                        let i = match app.filter_state.selected() {
-                                            Some(i) => if i == 0 { app.filter_items.len() - 1 } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        app.filter_state.select(Some(i));
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(idx) = app.filter_state.selected() {
-                                            let style = app.filter_items[idx];
-                                            let filters = get_filters_for_style(style);
-                                            let payload = FilterPayload {
-                                                action: "filter",
-                                                guild_id: app.guild_id.clone(),
-                                                user_id: app.user_id.clone(),
-                                                filters,
-                                            };
-                                            tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), payload));
-                                            app.view = View::Main;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            },
-                            View::Lyrics => {
-                                match key.code {
-                                    KeyCode::Esc => app.view = View::Main,
-                                    KeyCode::Backspace => app.view = View::Menu,
-                                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
-                                        app.lyrics_scroll = app.lyrics_scroll.saturating_add(1);
-                                    },
-                                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
-                                        app.lyrics_scroll = app.lyrics_scroll.saturating_sub(1);
-                                    },
-                                    _ => {}
-                                }
-                            },
-                            View::Main => {
-                                match key.code {
-                                    KeyCode::Char('q') | KeyCode::Char('й') => return Ok(()),
-                                    KeyCode::Char('r') | KeyCode::Char('к') => {
-                                        tokio::spawn(async_fetch_queue(app_arc.clone()));
-                                    }
-                                    KeyCode::Tab => {
-                                        app.view = View::Menu;
-                                    }
-                                    KeyCode::Enter => {
-                                        app.input_mode = InputMode::Editing;
-                                    }
-                                    KeyCode::Char('l') | KeyCode::Char('д') => {
-                                        let new_mode = match app.loop_mode.as_str() {
-                                            "off" => "track",
-                                            "track" => "queue",
-                                            "queue" => "off",
-                                            _ => "off",
-                                        };
-                                        app.loop_mode = new_mode.to_string();
-                                        tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: new_mode.to_string() }));
-                                    }
-                                    KeyCode::Char('s') | KeyCode::Char('ы') | KeyCode::Char('і') => {
-                                        tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "skip", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
-                                    }
-                                    KeyCode::Char('w') | KeyCode::Char('ц') => {
-                                        tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "stop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
-                                    }
-                                    KeyCode::Char('c') | KeyCode::Char('с') => {
-                                        tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "clear", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
-                                    }
-                                    KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                                        app.view = View::Debug;
-                                    }
-                                    KeyCode::Char(c) => {
-                                        app.input_mode = InputMode::Editing;
-                                        app.input.push(c);
-                                    }
-                                    _ => {}
-                                }
+                    // View-Specific Handlers
+                    match app.view {
+                        View::Main => handle_player_keys(&mut *app, key, app_arc.clone()),
+                        View::Lyrics => handle_lyrics_keys(&mut *app, key),
+                        View::Settings => handle_settings_keys(&mut *app, key, app_arc.clone()),
+                        View::Debug => handle_debug_keys(&mut *app, key),
+                        View::Menu => { if handle_menu_keys(&mut *app, key, app_arc.clone())? { return Ok(()); } },
+                        View::FilterMenu => handle_filter_menu_keys(&mut *app, key, app_arc.clone()),
+                        View::AuthMenu => handle_auth_menu_keys(&mut *app, key, app_arc.clone()),
+                        View::AuthResult => {
+                            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace) {
+                                app.view = View::AuthMenu;
                             }
-                            View::Debug => {
-                                match key.code {
-                                    KeyCode::Char('s') | KeyCode::Char('ы') => {
-                                        app.save_spectrogram();
-                                    }
-                                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('й') => {
-                                        if app.token.is_none() {
-                                            app.view = View::LoginRequired;
-                                        } else {
-                                            app.view = View::Main;
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                        }
+                        View::AppInfo => {
+                            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace | KeyCode::Char('i') | KeyCode::Char('ш')) {
+                                app.view = View::Main;
+                            }
+                        }
+                        View::LoginRequired => {
+                            if key.code == KeyCode::Enter {
+                                tokio::spawn(async_auth_login(app_arc.clone()));
+                            } else if key.code == KeyCode::Char('\\') {
+                                app.settings_input = app.base_url.clone();
+                                app.view = View::Settings;
+                            } else if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('й')) {
+                                return Ok(());
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn handle_editing_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) {
+    match key.code {
+        KeyCode::Enter => {
+            let query = app.input.clone();
+            app.input.clear();
+            app.input_mode = InputMode::Normal;
+            tokio::spawn(async_play_track(app_arc, query));
+        }
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Normal;
+            app.input.clear();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Backspace => { app.input.pop(); }
+        _ => {}
+    }
+}
+
+fn handle_player_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) {
+    match key.code {
+        KeyCode::Char('r') | KeyCode::Char('к') => {
+            tokio::spawn(async_fetch_queue(app_arc));
+        }
+        KeyCode::Tab => app.view = View::Menu,
+        KeyCode::Enter => app.input_mode = InputMode::Editing,
+        KeyCode::Char('l') | KeyCode::Char('д') => {
+            let new_mode = match app.loop_mode.as_str() {
+                "off" => "track",
+                "track" => "queue",
+                "queue" => "off",
+                _ => "off",
+            };
+            app.loop_mode = new_mode.to_string();
+            tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: new_mode.to_string() }));
+        }
+        KeyCode::Char('s') | KeyCode::Char('ы') | KeyCode::Char('і') => {
+            tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), SimplePayload { action: "skip", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
+        }
+        KeyCode::Char('p') | KeyCode::Char('з') => {
+            tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), SimplePayload { action: "pause", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
+        }
+        KeyCode::Char('w') | KeyCode::Char('ц') => {
+            tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), SimplePayload { action: "stop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
+        }
+        KeyCode::Char('c') | KeyCode::Char('с') => {
+            tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), SimplePayload { action: "clear", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() }));
+        }
+        KeyCode::Char('i') | KeyCode::Char('ш') => {
+            app.view = View::AppInfo;
+        }
+        KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            app.view = View::Debug;
+        }
+        KeyCode::Char(c) => {
+            app.input_mode = InputMode::Editing;
+            app.input.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_lyrics_keys(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Backspace => app.view = View::Main,
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
+            app.lyrics_scroll = app.lyrics_scroll.saturating_add(1);
+        },
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
+            app.lyrics_scroll = app.lyrics_scroll.saturating_sub(1);
+        },
+        _ => {}
+    }
+}
+
+fn handle_settings_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) {
+    if app.is_settings_editing {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => {
+                app.is_settings_editing = false;
+                save_app_settings(app);
+                // If host changed, we might need reconnect
+                if app.base_url != app.settings_input {
+                    app.base_url = app.settings_input.clone();
+                    app.needs_reconnect = true;
+                    tokio::spawn(async_fetch_queue(app_arc));
+                }
+                if let Ok(offset) = app.offset_input.parse::<i64>() {
+                    app.visualizer_offset = offset;
+                }
+            }
+            KeyCode::Char(c) => {
+                match app.settings_field {
+                    SettingsField::Host => { app.settings_input.push(c); }
+                    SettingsField::Offset => { 
+                        if c.is_ascii_digit() || (c == '-' && app.offset_input.is_empty()) { 
+                            app.offset_input.push(c); 
+                        } 
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Backspace => {
+                match app.settings_field {
+                    SettingsField::Host => { app.settings_input.pop(); }
+                    SettingsField::Offset => { app.offset_input.pop(); }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Enter => {
+            match app.settings_field {
+                SettingsField::Host | SettingsField::Offset => {
+                    app.is_settings_editing = true;
+                }
+                _ => {
+                    save_app_settings(app);
+                    app.view = if app.token.is_none() { View::LoginRequired } else { View::Main };
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.view = if app.token.is_none() { View::LoginRequired } else { View::Main };
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            app.settings_field = match app.settings_field {
+                SettingsField::Host => SettingsField::Offset,
+                SettingsField::Offset => SettingsField::Theme,
+                SettingsField::Theme => SettingsField::VizStyle,
+                SettingsField::VizStyle => SettingsField::Layout,
+                SettingsField::Layout => SettingsField::Host,
+            };
+        }
+        KeyCode::Up => {
+            app.settings_field = match app.settings_field {
+                SettingsField::Host => SettingsField::Layout,
+                SettingsField::Offset => SettingsField::Host,
+                SettingsField::Theme => SettingsField::Offset,
+                SettingsField::VizStyle => SettingsField::Theme,
+                SettingsField::Layout => SettingsField::VizStyle,
+            };
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('д') => {
+            match app.settings_field {
+                SettingsField::Theme => {
+                    app.theme = match app.theme.as_str() {
+                        "Default" => "Midnight".to_string(),
+                        "Midnight" => "Emerald".to_string(),
+                        "Emerald" => "Ruby".to_string(),
+                        "Ruby" => "Ocean".to_string(),
+                        "Ocean" => "Synthwave".to_string(),
+                        "Synthwave" => "Sepia".to_string(),
+                        _ => "Default".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                SettingsField::VizStyle => {
+                    app.viz_style = match app.viz_style.as_str() {
+                        "Bars" => "Blocky".to_string(),
+                        "Blocky" => "Line".to_string(),
+                        "Line" => "Wave".to_string(),
+                        "Wave" => "Dots".to_string(),
+                        _ => "Bars".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                SettingsField::Layout => {
+                    app.layout = match app.layout.as_str() {
+                        "Standard" => "Sidebar".to_string(),
+                        "Sidebar" => "Studio".to_string(),
+                        "Studio" => "Zen".to_string(),
+                        "Zen" => "Standard".to_string(),
+                        _ => "Standard".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('р') => {
+            match app.settings_field {
+                SettingsField::Theme => {
+                    app.theme = match app.theme.as_str() {
+                        "Default" => "Sepia".to_string(),
+                        "Midnight" => "Default".to_string(),
+                        "Emerald" => "Midnight".to_string(),
+                        "Ruby" => "Emerald".to_string(),
+                        "Ocean" => "Ruby".to_string(),
+                        "Synthwave" => "Ocean".to_string(),
+                        "Sepia" => "Synthwave".to_string(),
+                        _ => "Default".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                SettingsField::VizStyle => {
+                    app.viz_style = match app.viz_style.as_str() {
+                        "Bars" => "Dots".to_string(),
+                        "Blocky" => "Bars".to_string(),
+                        "Line" => "Blocky".to_string(),
+                        "Wave" => "Line".to_string(),
+                        "Dots" => "Wave".to_string(),
+                        _ => "Bars".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                SettingsField::Layout => {
+                    app.layout = match app.layout.as_str() {
+                        "Standard" => "Zen".to_string(),
+                        "Sidebar" => "Standard".to_string(),
+                        "Studio" => "Sidebar".to_string(),
+                        "Zen" => "Studio".to_string(),
+                        _ => "Standard".to_string(),
+                    };
+                    save_app_settings(app);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn save_app_settings(app: &App) {
+    let settings = api::Settings { 
+        base_url: app.settings_input.clone(),
+        visualizer_offset: app.offset_input.parse().unwrap_or(app.visualizer_offset),
+        theme: app.theme.clone(),
+        visualizer_style: app.viz_style.clone(),
+        layout: app.layout.clone(),
+    };
+    let _ = api::save_settings(&settings);
+}
+
+fn handle_debug_keys(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Char('s') | KeyCode::Char('ы') => app.save_spectrogram(),
+        KeyCode::Esc | KeyCode::Backspace => {
+            app.view = if app.token.is_none() { View::LoginRequired } else { View::Main };
+        }
+        _ => {}
+    }
+}
+
+fn handle_menu_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Tab => { app.view = View::Main; }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
+            let i = match app.menu_state.selected() {
+                Some(i) => if i >= app.menu_items.len() - 1 { 0 } else { i + 1 },
+                None => 0,
+            };
+            app.menu_state.select(Some(i));
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
+            let i = match app.menu_state.selected() {
+                Some(i) => if i == 0 { app.menu_items.len() - 1 } else { i - 1 },
+                None => 0,
+            };
+            app.menu_state.select(Some(i));
+        }
+        KeyCode::Enter => {
+            if let Some(idx) = app.menu_state.selected() {
+                let item = app.menu_items[idx].trim();
+                if item.contains("Skip") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "skip", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
+                else if item.contains("Pause/Resume") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "pause", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
+                else if item.contains("Stop") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "stop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
+                else if item.contains("Shuffle") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "shuffle", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
+                else if item.contains("Clear Queue") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), SimplePayload { action: "clear", guild_id: app.guild_id.clone(), user_id: app.user_id.clone() })); }
+                else if item.contains("Loop Track") { app.loop_mode = "track".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "track".to_string() })); }
+                else if item.contains("Loop Queue") { app.loop_mode = "queue".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "queue".to_string() })); }
+                else if item.contains("Loop Off") { app.loop_mode = "off".to_string(); tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), LoopPayload { action: "loop", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), loop_mode: "off".to_string() })); }
+                else if item.contains("24/7 Mode") { tokio::spawn(async_simple_command(app_arc.clone(), "/webhook/audio".to_string(), TwentyFourSevenPayload { action: "247", guild_id: app.guild_id.clone(), user_id: app.user_id.clone(), enabled: None })); }
+                else if item.contains("Filters...") { app.view = View::FilterMenu; }
+                else if item.contains("Lyrics") { tokio::spawn(async_fetch_lyrics(app_arc.clone())); }
+                else if item.contains("Play Turip") { tokio::spawn(async_play_track(app_arc.clone(), "https://open.spotify.com/track/2RQWB4Asy1rjZL4IUcJ7kn".to_string())); }
+                else if item.contains("Auth") { app.view = View::AuthMenu; }
+                else if item.contains("Settings") { 
+                    app.settings_input = app.base_url.clone();
+                    app.view = View::Settings; 
+                }
+                else if item.contains("Exit TUI") { return Ok(true); }
+
+                if !item.contains("Filters...") && !item.contains("Lyrics") && !item.contains("Auth") && !item.contains("Settings") {
+                    app.view = View::Main;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_filter_menu_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) {
+    match key.code {
+        KeyCode::Esc => app.view = View::Main,
+        KeyCode::Backspace => app.view = View::Menu,
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
+            let i = match app.filter_state.selected() {
+                Some(i) => if i >= app.filter_items.len() - 1 { 0 } else { i + 1 },
+                None => 0,
+            };
+            app.filter_state.select(Some(i));
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
+            let i = match app.filter_state.selected() {
+                Some(i) => if i == 0 { app.filter_items.len() - 1 } else { i - 1 },
+                None => 0,
+            };
+            app.filter_state.select(Some(i));
+        }
+        KeyCode::Enter => {
+            if let Some(idx) = app.filter_state.selected() {
+                let style = app.filter_items[idx];
+                let filters = get_filters_for_style(style);
+                let payload = FilterPayload {
+                    action: "filter",
+                    guild_id: app.guild_id.clone(),
+                    user_id: app.user_id.clone(),
+                    filters,
+                };
+                tokio::spawn(async_simple_command(app_arc, "/webhook/audio".to_string(), payload));
+                app.view = View::Main;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_auth_menu_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<App>>) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Tab => app.view = View::Main,
+        KeyCode::Backspace => app.view = View::Menu,
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
+            let i = match app.auth_menu_state.selected() {
+                Some(i) => if i >= app.auth_menu_items.len() - 1 { 0 } else { i + 1 },
+                None => 0,
+            };
+            app.auth_menu_state.select(Some(i));
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
+            let i = match app.auth_menu_state.selected() {
+                Some(i) => if i == 0 { app.auth_menu_items.len() - 1 } else { i - 1 },
+                None => 0,
+            };
+            app.auth_menu_state.select(Some(i));
+        }
+        KeyCode::Enter => {
+            if let Some(idx) = app.auth_menu_state.selected() {
+                match app.auth_menu_items[idx] {
+                    "Login" => { tokio::spawn(async_auth_login(app_arc)); }
+                    "Signout" => { tokio::spawn(async_auth_signout(app_arc)); }
+                    "Info" => {
+                        if let Some(auth) = api::load_auth() {
+                            let mut info = String::new();
+                            if let Some(path) = api::config_file_path() {
+                                info.push_str(&format!("Auth file: {}\n", path.display()));
+                            }
+                            info.push_str(&format!("User: {}\n", auth.username.unwrap_or_else(|| "Unknown".to_string())));
+                            if let Some(avatar) = auth.avatar_url {
+                                info.push_str(&format!("Avatar: {}\n", avatar));
+                            }
+                            let token_masked = if auth.token.len() > 8 {
+                                format!("{}...{}", &auth.token[0..4], &auth.token[auth.token.len() - 4..])
+                            } else {
+                                auth.token
+                            };
+                            info.push_str(&format!("Token: {}", token_masked));
+                            app.auth_info_text = Some(info);
+                            app.view = View::AuthResult;
+                        } else {
+                            app.auth_info_text = Some("Not authenticated. Run Login.".to_string());
+                            app.view = View::AuthResult;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1344,301 +1638,282 @@ fn get_filters_for_style(style: &str) -> AudioFilters {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    let theme = get_theme(&app.theme);
+    
+    // Base background color for the entire UI
+    f.render_widget(Block::default().bg(theme.bg), f.area());
+
     if app.view == View::LoginRequired {
         let area = f.area();
         f.render_widget(Clear, area);
+        f.render_widget(Block::default().bg(theme.bg), area);
         
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(12), // Logo
-                Constraint::Length(2),  // Spacer
-                Constraint::Length(8),  // Text
+                Constraint::Length(10), // Text
                 Constraint::Min(1),
             ])
             .split(area);
 
         // Logo
-        let art_text: Vec<Line> = ASCII_LOGO.iter().map(|s| Line::from(Span::styled(*s, Style::default().fg(JORIK_PURPLE)))).collect();
+        let art_text: Vec<Line> = ASCII_LOGO.iter().map(|s| Line::from(Span::styled(*s, Style::default().fg(theme.primary)))).collect();
         let art_paragraph = Paragraph::new(art_text)
             .alignment(Alignment::Center);
         f.render_widget(art_paragraph, chunks[1]);
 
         // Text
+        let login_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(theme.border))
+            .padding(ratatui::widgets::Padding::uniform(1));
+
         let text = if app.is_loading || (app.auth_info_text.is_some() && app.auth_info_text.as_deref() != Some("Initializing login...")) {
              let status = app.auth_info_text.clone().unwrap_or_else(|| "Authenticating...".to_string());
              vec![
-                Line::from(Span::styled("Authenticating...", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))),
+                Line::from(Span::styled(" AUTHENTICATING ", Style::default().add_modifier(Modifier::BOLD).bg(Color::Yellow).fg(Color::Black))),
                 Line::from(""),
                 Line::from(status),
+                Line::from(""),
+                Line::from(Span::styled("Please wait while we connect to Discord...", Style::default().fg(theme.text_secondary))),
              ]
         } else {
              vec![
-                Line::from(Span::styled("Authentication Required", Style::default().add_modifier(Modifier::BOLD).fg(Color::Red))),
+                Line::from(Span::styled(" LOGIN REQUIRED ", Style::default().add_modifier(Modifier::BOLD).bg(Color::Red).fg(Color::White))),
                 Line::from(""),
                 Line::from("To use Jorik CLI, you must log in with your Discord account."),
                 Line::from("This allows us to access your voice channels and manage playback."),
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD).fg(JORIK_PURPLE)),
+                    Span::styled(" ENTER ", Style::default().bg(theme.primary).fg(Color::Black).add_modifier(Modifier::BOLD)),
                     Span::raw(" to Login"),
                 ]),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled("\\", Style::default().add_modifier(Modifier::BOLD).fg(JORIK_PURPLE)),
+                    Span::styled(" \\ ", Style::default().bg(theme.highlight).fg(Color::Black).add_modifier(Modifier::BOLD)),
                     Span::raw(" to Change Host"),
-                ]),
-                Line::from(vec![
-                    Span::raw("Press "),
-                    Span::styled("q", Style::default().add_modifier(Modifier::BOLD).fg(JORIK_PURPLE)),
-                    Span::raw(" to Quit"),
                 ]),
             ]
         };
         
         let p = Paragraph::new(text)
             .alignment(Alignment::Center)
+            .block(login_block)
             .wrap(Wrap { trim: true });
-        f.render_widget(p, chunks[3]);
+        
+        let text_area = centered_rect(60, 30, area);
+        f.render_widget(Clear, text_area);
+        f.render_widget(p, text_area);
         return;
     }
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(3),
         ])
         .split(f.area());
 
-    let top_section = main_layout[0];
-    let status_bar_area = main_layout[1];
+    let tabs_area = main_layout[0];
+    let top_section = main_layout[1];
+    let status_bar_area = main_layout[2];
 
-    let content_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(65),
-            Constraint::Percentage(35),
-        ])
-        .split(top_section);
+    // Render Tabs
+    let tab_titles = vec![" [1] PLAYER ", " [2] LYRICS ", " [3] SETTINGS ", " [4] DEBUG "];
+    let selected_tab = match app.view {
+        View::Main | View::Menu | View::FilterMenu | View::AuthMenu | View::AuthResult => 0,
+        View::Lyrics => 1,
+        View::Settings => 2,
+        View::Debug => 3,
+        _ => 0,
+    };
 
-    let left_side = content_chunks[0];
-    let spectrogram_area = content_chunks[1];
+    let tabs = Tabs::new(tab_titles)
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme.border)))
+        .select(selected_tab)
+        .style(Style::default().fg(theme.text_secondary))
+        .highlight_style(Style::default().fg(theme.highlight).add_modifier(Modifier::BOLD))
+        .divider(Span::styled(" | ", Style::default().fg(theme.border)));
 
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(12),
-            Constraint::Min(0),
-        ])
-        .split(left_side);
+    f.render_widget(tabs, tabs_area);
 
-    let logo_area = left_chunks[0];
-    let queue_area = left_chunks[1];
-
-    // 1. ASCII Art
-    let art_text: Vec<Line> = ASCII_LOGO.iter().map(|s| Line::from(Span::styled(*s, Style::default().fg(JORIK_PURPLE)))).collect();
-    let art_paragraph = Paragraph::new(art_text)
-        .alignment(Alignment::Center)
-        .block(Block::default());
-    f.render_widget(art_paragraph, logo_area);
-
-    // 2. Main Content (Queue or Error)
-    let loop_status = app.loop_mode.to_uppercase();
-    let loading_indicator = if app.is_loading { " ⏳ Loading... " } else { " " };
-    let title = format!(" Queue (Loop: {}){} ", loop_status, loading_indicator);
-    
-    let content_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(JORIK_PURPLE))
-        .title_style(Style::default().fg(JORIK_PURPLE).add_modifier(Modifier::BOLD))
-        .title(title)
-        .style(Style::default());
-
-    if let Some(err) = &app.error_message {
-        let p = Paragraph::new(format!("⚠ {}", err))
-            .style(Style::default().fg(Color::Red))
-            .block(content_block)
-            .wrap(Wrap { trim: true });
-        f.render_widget(p, queue_area);
-    } else {
-        let mut items = Vec::new();
-        
-        if let Some(current) = &app.current_track {
-             items.push(ListItem::new(Line::from(vec![
-                Span::styled(" NOW PLAYING ", Style::default().bg(JORIK_PURPLE).fg(Color::Black).add_modifier(Modifier::BOLD)),
-             ])));
-             items.push(ListItem::new(Line::from(vec![
-                Span::styled("   ▶ ", Style::default().fg(JORIK_PURPLE)),
-                Span::styled(current, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ])));
-
-            // Progress Bar
-            if app.duration_ms > 0 {
-                let ratio = (app.elapsed_ms as f64 / app.duration_ms as f64).min(1.0);
-                let pct_val = (ratio * 100.0) as usize;
-                let pct = (ratio * 30.0).round() as usize;
-                let bar = "━".repeat(pct.min(30)) + "⚪" + &"━".repeat(30usize.saturating_sub(pct));
-                let time_str = format!(
-                    " {:02}:{:02} / {:02}:{:02} ({:3}%) ",
-                    app.elapsed_ms / 60000,
-                    (app.elapsed_ms % 60000) / 1000,
-                    app.duration_ms / 60000,
-                    (app.duration_ms % 60000) / 1000,
-                    pct_val
-                );
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled(bar, Style::default().fg(JORIK_PURPLE)),
-                    Span::styled(time_str, Style::default().fg(Color::Gray)),
-                ])));
-            }
-            items.push(ListItem::new(Span::raw("")));
-        } else {
-            items.push(ListItem::new(Span::styled("Nothing playing", Style::default().fg(Color::DarkGray))));
-            items.push(ListItem::new(Span::raw("")));
-        }
-        
-        if !app.queue.is_empty() {
-             items.push(ListItem::new(Line::from(vec![
-                Span::styled(" UP NEXT ", Style::default().fg(JORIK_PURPLE).add_modifier(Modifier::BOLD)),
-             ])));
-             for (i, track) in app.queue.iter().enumerate() {
-                items.push(ListItem::new(format!("   {}. {}", i + 1, track)).style(Style::default().fg(Color::Gray)));
-            }
-        } else {
-             items.push(ListItem::new(Span::styled("   Queue is empty", Style::default().fg(Color::DarkGray))));
-        }
-
-        let list = List::new(items)
-            .block(content_block);
-        f.render_widget(list, queue_area);
-    }
-
-    // Spectrogram
-    let spec_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(JORIK_PURPLE))
-        .title(" Visualizer ")
-        .title_style(Style::default().fg(JORIK_PURPLE).add_modifier(Modifier::BOLD));
-
-    if app.current_track.is_some() {
-        // Bar width 2 + Gap 1 = 3 cells per bar
-        let num_bars = (spectrogram_area.width / 3).min(64) as usize;
-        let mut bar_items = Vec::with_capacity(num_bars);
-
-        if num_bars > 0 {
-            let bins_per_bar = 64.0 / num_bars as f32;
-            for j in 0..num_bars {
-                let start_f = j as f32 * bins_per_bar;
-                let end_f = (j + 1) as f32 * bins_per_bar;
+    match app.view {
+        View::Lyrics => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .title(format!(" Lyrics {} ", if app.is_loading { " ⏳ " } else { "" }))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(theme.primary));
+            
+            let text = app.lyrics_text.as_deref().unwrap_or("Loading...");
+            let p = Paragraph::new(text)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.lyrics_scroll, 0));
                 
-                let mut sum = 0.0;
-                let mut weight = 0.0;
-                
-                for i in 0..64 {
-                    let overlap = ((i + 1) as f32).min(end_f) - (i as f32).max(start_f);
-                    if overlap > 0.0 {
-                        sum += app.smoothed_bars[i] * overlap;
-                        weight += overlap;
-                    }
-                }
-                let val = if weight > 0.0 { sum / weight } else { 0.0 };
-                bar_items.push(val as u64);
-            }
+            f.render_widget(p, top_section);
         }
+        View::Settings => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .title(" Settings ")
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(theme.primary));
+            
+            let f_field = app.settings_field;
+            let is_ed = app.is_settings_editing;
+            
+            let h_s = |f| if f_field == f { 
+                if is_ed { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) }
+                else { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) }
+            } else { Style::default().fg(theme.text_secondary) };
 
-        let bar_labels: Vec<String> = bar_items.iter()
-            .map(|&v| format!("{:2}", v.min(99)))
-            .collect();
+            let h_l = |f, l| if f_field == f { 
+                if is_ed { format!(" >> [EDITING] {}", l) }
+                else { format!(" >> {}", l) }
+            } else { format!("    {}", l) };
 
-        let bars: Vec<Bar> = bar_items.iter().enumerate()
-            .map(|(i, &v)| {
-                Bar::default()
-                    .value(v)
-                    .label(Span::from(bar_labels[i].as_str()))
-                    .text_value(String::new())
-            })
-            .collect();
-        
-        let bar_group = BarGroup::default().bars(&bars);
-        
-        // Split area into chart and labels
-        let spec_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(1),
+            let p = Paragraph::new(vec![
+                Line::from("Configure your experience:"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(h_l(SettingsField::Host, "Webhook Host: "), h_s(SettingsField::Host)),
+                    Span::styled(&app.settings_input, h_s(SettingsField::Host)),
+                ]),
+                Line::from(vec![
+                    Span::styled(h_l(SettingsField::Offset, "Visualizer Offset (ms): "), h_s(SettingsField::Offset)),
+                    Span::styled(&app.offset_input, h_s(SettingsField::Offset)),
+                ]),
+                Line::from(vec![
+                    Span::styled(h_l(SettingsField::Theme, "Color Theme: "), h_s(SettingsField::Theme)),
+                    Span::styled(format!("< {} >", app.theme), h_s(SettingsField::Theme)),
+                ]),
+                Line::from(vec![
+                    Span::styled(h_l(SettingsField::VizStyle, "Visualizer Style: "), h_s(SettingsField::VizStyle)),
+                    Span::styled(format!("< {} >", app.viz_style), h_s(SettingsField::VizStyle)),
+                ]),
+                Line::from(vec![
+                    Span::styled(h_l(SettingsField::Layout, "UI Layout: "), h_s(SettingsField::Layout)),
+                    Span::styled(format!("< {} >", app.layout), h_s(SettingsField::Layout)),
+                ]),
+                Line::from(""),
+                Line::from(if is_ed {
+                    Span::styled("TYPE TO EDIT, ENTER TO FINISH", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled("NAVIGATE WITH ARROWS/TAB, ENTER ON TEXT TO EDIT, ESC TO EXIT", Style::default().fg(theme.text_secondary))
+                }),
             ])
-            .split(spec_block.inner(spectrogram_area));
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true });
+                
+            f.render_widget(p, top_section);
 
-        let barchart = BarChart::default()
-            .data(bar_group)
-            .bar_width(2)
-            .bar_gap(1)
-            .max(100) 
-            .bar_style(Style::default().fg(JORIK_PURPLE))
-            .label_style(Style::default().fg(Color::White));
-        
-        f.render_widget(spec_block, spectrogram_area);
-        f.render_widget(barchart, spec_chunks[0]);
-
-        // Custom label rendering for frequency
-        let labels = ["30", "100", "500", "1k", "5k", "10k", "20k"];
-        let mut label_spans = Vec::new();
-        let total_w = spec_chunks[1].width as usize;
-        
-        if total_w > 10 {
-            for (i, &l) in labels.iter().enumerate() {
-                let pos = (i as f32 / (labels.len() - 1) as f32 * (total_w - l.len()) as f32) as usize;
-                let current_len: usize = label_spans.iter().map(|s: &Span| s.content.len()).sum();
-                if pos > current_len {
-                    label_spans.push(Span::raw(" ".repeat(pos - current_len)));
+            // Show cursor when editing settings
+            if is_ed {
+                let cursor_y = match f_field {
+                    SettingsField::Host => top_section.y + 3,
+                    SettingsField::Offset => top_section.y + 4,
+                    _ => 0,
+                };
+                let prefix_len = match f_field {
+                    SettingsField::Host => 27, // " >> [EDITING] Webhook Host: "
+                    SettingsField::Offset => 37, // " >> [EDITING] Visualizer Offset (ms): "
+                    _ => 0,
+                };
+                let input_len = match f_field {
+                    SettingsField::Host => app.settings_input.len(),
+                    SettingsField::Offset => app.offset_input.len(),
+                    _ => 0,
+                };
+                if cursor_y > 0 {
+                    f.set_cursor_position((
+                        top_section.x + 1 + prefix_len + input_len as u16,
+                        cursor_y,
+                    ));
                 }
-                label_spans.push(Span::styled(l, Style::default().fg(Color::DarkGray)));
             }
-            f.render_widget(Paragraph::new(Line::from(label_spans)), spec_chunks[1]);
         }
-    } else {
-        f.render_widget(Paragraph::new("Idle (No Track)").block(spec_block).alignment(Alignment::Center), spectrogram_area);
+        View::Debug => {
+            let ws_status = if app.ws_connected {
+                Span::styled(" CONNECTED ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD))
+            } else if app.ws_connecting {
+                Span::styled(" CONNECTING... ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" DISCONNECTED ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .title(vec![
+                    Span::raw(" Debug Console "), 
+                    ws_status,
+                    Span::raw(" (Press 's' to Save Spectrogram) ")
+                ])
+                .title_alignment(Alignment::Left)
+                .border_style(Style::default().fg(Color::Yellow));
+            
+            let log_lines: Vec<Line> = app.debug_logs.iter()
+                .rev()
+                .map(|l| Line::from(l.as_str()))
+                .collect();
+            
+            let p = Paragraph::new(log_lines)
+                .block(block)
+                .wrap(Wrap { trim: false });
+            
+            f.render_widget(p, top_section);
+        }
+        _ => {
+            render_player_ui(f, app, &theme, top_section);
+        }
     }
 
-    // 3. Status Bar / Hint
     if app.input_mode == InputMode::Normal && app.view == View::Main {
         let keys = vec![
-            ("Type", "Search"),
-            ("Enter", "Play"),
-            ("Tab", "Menu"),
-            ("s", "Skip"),
-            ("w", "Stop"),
-            ("c", "Clear"),
-            ("l", "Loop"),
-            ("r", "Refresh"),
-            ("q", "Quit"),
+            ("ENTER", "SEARCH"),
+            ("TAB", "MENU"),
+            ("S", "SKIP"),
+            ("W", "STOP"),
+            ("L", "LOOP"),
+            ("R", "RELOAD"),
+            ("I", "INFO"),
+            ("Q", "QUIT"),
         ];
         
         let mut spans = Vec::new();
+        spans.push(Span::styled(" >> ", Style::default().fg(theme.primary)));
+        spans.push(Span::styled("COMMANDS ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        
         for (key, desc) in keys {
-            spans.push(Span::styled(format!(" {} ", key), Style::default().bg(JORIK_PURPLE).fg(Color::Black).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled(format!(" {} ", desc), Style::default().fg(Color::Gray)));
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" {} ", key), Style::default().fg(theme.highlight).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!("{} ", desc), Style::default().fg(theme.text_secondary)));
+            spans.push(Span::styled("|", Style::default().fg(theme.border)));
+        }
+
+        let version = env!("CARGO_PKG_VERSION");
+        if version.chars().any(|c| c.is_ascii_lowercase()) {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(" ! DEV UNSTABLE BUILD ! ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
         }
 
         let p = Paragraph::new(Line::from(spans))
-            .style(Style::default())
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::TOP).border_type(BorderType::Double).border_style(Style::default().fg(Color::DarkGray)));
+            .style(Style::default().bg(theme.bg))
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(theme.border)));
             
         f.render_widget(p, status_bar_area);
     }
 
-    // Overlays
-
-    // Input Box
     if app.input_mode == InputMode::Editing {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
@@ -1646,30 +1921,42 @@ fn ui(f: &mut Frame, app: &mut App) {
         let loading_text = if app.is_loading { " ⏳ " } else { "" };
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Thick)
             .title(format!(" Play / Search {} ", loading_text))
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_HIGHLIGHT));
+            .border_style(Style::default().fg(theme.highlight));
         
         let p = Paragraph::new(app.input.as_str())
             .block(input_block)
             .style(Style::default().fg(Color::White))
             .wrap(Wrap { trim: true });
         f.render_widget(p, area);
+
+        // Show cursor in Search popup
+        f.set_cursor_position((
+            area.x + 1 + app.input.len() as u16,
+            area.y + 1,
+        ));
     }
 
-    // Menu Box
     if app.view == View::Menu {
         let area = centered_rect(40, 50, f.area());
+        
+        // Shadow
+        let shadow_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width, height: area.height };
+        if shadow_area.right() < f.area().right() && shadow_area.bottom() < f.area().bottom() {
+            f.render_widget(Block::default().bg(Color::Rgb(10, 10, 20)), shadow_area);
+        }
+
         f.render_widget(Clear, area);
         
         let loading_text = if app.is_loading { " ⏳ " } else { "" };
         let menu_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Thick)
             .title(format!(" Menu {} ", loading_text))
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
+            .border_style(Style::default().fg(theme.primary));
         
         let items: Vec<ListItem> = app.menu_items
             .iter()
@@ -1678,24 +1965,30 @@ fn ui(f: &mut Frame, app: &mut App) {
             
         let list = List::new(items)
             .block(menu_block)
-            .highlight_style(Style::default().bg(JORIK_PURPLE).fg(Color::White).add_modifier(Modifier::BOLD))
-            .highlight_symbol(" ➤ ");
+            .highlight_style(Style::default().bg(theme.primary).fg(Color::Black).add_modifier(Modifier::BOLD))
+            .highlight_symbol(" >> ");
             
         f.render_stateful_widget(list, area, &mut app.menu_state);
     }
 
-    // Filter Menu Box
     if app.view == View::FilterMenu {
         let area = centered_rect(40, 50, f.area());
+        
+        // Shadow
+        let shadow_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width, height: area.height };
+        if shadow_area.right() < f.area().right() && shadow_area.bottom() < f.area().bottom() {
+            f.render_widget(Block::default().bg(Color::Rgb(10, 10, 20)), shadow_area);
+        }
+
         f.render_widget(Clear, area);
         
         let loading_text = if app.is_loading { " ⏳ " } else { "" };
         let menu_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Thick)
             .title(format!(" Select Filter {} ", loading_text))
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
+            .border_style(Style::default().fg(theme.primary));
         
         let items: Vec<ListItem> = app.filter_items
             .iter()
@@ -1704,24 +1997,30 @@ fn ui(f: &mut Frame, app: &mut App) {
             
         let list = List::new(items)
             .block(menu_block)
-            .highlight_style(Style::default().bg(JORIK_PURPLE).fg(Color::White).add_modifier(Modifier::BOLD))
-            .highlight_symbol(" ➤ ");
+            .highlight_style(Style::default().bg(theme.primary).fg(Color::Black).add_modifier(Modifier::BOLD))
+            .highlight_symbol(" >> ");
             
         f.render_stateful_widget(list, area, &mut app.filter_state);
     }
 
-    // Auth Menu Box
     if app.view == View::AuthMenu {
         let area = centered_rect(40, 40, f.area());
+        
+        // Shadow
+        let shadow_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width, height: area.height };
+        if shadow_area.right() < f.area().right() && shadow_area.bottom() < f.area().bottom() {
+            f.render_widget(Block::default().bg(Color::Rgb(10, 10, 20)), shadow_area);
+        }
+
         f.render_widget(Clear, area);
         
         let loading_text = if app.is_loading { " ⏳ " } else { "" };
         let menu_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Thick)
             .title(format!(" Auth {} ", loading_text))
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
+            .border_style(Style::default().fg(theme.primary));
         
         let items: Vec<ListItem> = app.auth_menu_items
             .iter()
@@ -1730,23 +2029,22 @@ fn ui(f: &mut Frame, app: &mut App) {
             
         let list = List::new(items)
             .block(menu_block)
-            .highlight_style(Style::default().bg(JORIK_PURPLE).fg(Color::White).add_modifier(Modifier::BOLD))
-            .highlight_symbol(" ➤ ");
+            .highlight_style(Style::default().bg(theme.primary).fg(Color::Black).add_modifier(Modifier::BOLD))
+            .highlight_symbol(" >> ");
             
         f.render_stateful_widget(list, area, &mut app.auth_menu_state);
     }
 
-    // Auth Result/Info Box
     if app.view == View::AuthResult {
         let area = centered_rect(60, 40, f.area());
         f.render_widget(Clear, area);
         
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Thick)
             .title(" Auth Info ")
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
+            .border_style(Style::default().fg(theme.primary));
         
         let text = app.auth_info_text.as_deref().unwrap_or("No data.");
         let p = Paragraph::new(text)
@@ -1756,113 +2054,53 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.render_widget(p, area);
     }
 
-    // Lyrics Box
-    if app.view == View::Lyrics {
-        let area = centered_rect(70, 70, f.area());
+    if app.view == View::AppInfo {
+        let area = centered_rect(60, 40, f.area());
         f.render_widget(Clear, area);
         
-        let loading_text = if app.is_loading { " ⏳ " } else { "" };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(format!(" Lyrics {} ", loading_text))
+            .border_type(BorderType::Thick)
+            .title(" Build Compatibility Info ")
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
+            .border_style(Style::default().fg(theme.highlight));
         
-        let text = app.lyrics_text.as_deref().unwrap_or("Loading...");
+        let text = vec![
+            Line::from(Span::styled("BUILD COMPATIBILITY", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))),
+            Line::from(""),
+            Line::from("This version of Jorik CLI is intended for use with"),
+            Line::from(vec![
+                Span::raw("the "),
+                Span::styled("INTERNAL DEV VERSION", Style::default().fg(theme.highlight).add_modifier(Modifier::BOLD)),
+                Span::raw(" of Jorik bot."),
+            ]),
+            Line::from(""),
+            Line::from("The production version will work, but with significantly"),
+            Line::from("reduced functionality (limited real-time features)."),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Current Version: "),
+                Span::styled(env!("CARGO_PKG_VERSION"), Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Press 'i' or Esc to close", Style::default().fg(theme.text_secondary))),
+        ];
+
         let p = Paragraph::new(text)
+            .alignment(Alignment::Center)
             .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.lyrics_scroll, 0));
+            .wrap(Wrap { trim: true });
             
         f.render_widget(p, area);
     }
 
-    // Settings Box
-    if app.view == View::Settings {
-        let area = centered_rect(60, 30, f.area());
-        f.render_widget(Clear, area);
-        
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Settings ")
-            .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(JORIK_PURPLE));
-        
-        let is_editing_host = app.settings_field == SettingsField::Host;
-        
-        let host_style = if is_editing_host { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
-        let offset_style = if !is_editing_host { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
-
-        let host_label = if is_editing_host { "▶ Webhook Host: " } else { "  Webhook Host: " };
-        let offset_label = if !is_editing_host { "▶ Visualizer Offset (ms): " } else { "  Visualizer Offset (ms): " };
-
-        let p = Paragraph::new(vec![
-            Line::from("Configure your connection and visualizer sync:"),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(host_label, host_style),
-                Span::styled(&app.settings_input, host_style),
-            ]),
-            Line::from(vec![
-                Span::styled(offset_label, offset_style),
-                Span::styled(&app.offset_input, offset_style),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("Use Arrows/Tab to switch, Enter to Save", Style::default().fg(Color::Gray))),
-        ])
-        .block(block)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true });
-            
-        f.render_widget(p, area);
-    }
-
-    // Debug Box
-    if app.view == View::Debug {
-        let area = centered_rect(80, 80, f.area());
-        f.render_widget(Clear, area);
-        
-        let ws_status = if app.ws_connected {
-            Span::styled(" CONNECTED ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD))
-        } else if app.ws_connecting {
-            Span::styled(" CONNECTING... ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
-        } else {
-            Span::styled(" DISCONNECTED ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
-        };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(vec![
-                Span::raw(" Debug Console "), 
-                ws_status,
-                Span::raw(" (Press 's' to Save Spectrogram) ")
-            ])
-            .title_alignment(Alignment::Left)
-            .border_style(Style::default().fg(Color::Yellow));
-        
-        let log_lines: Vec<Line> = app.debug_logs.iter()
-            .rev()
-            .map(|l| Line::from(l.as_str()))
-            .collect();
-            
-        let p = Paragraph::new(log_lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
-            
-        f.render_widget(p, area);
-    }
-
-    // Fatal Error Overlay
     if let Some(msg) = &app.fatal_error {
         let area = centered_rect(60, 25, f.area());
         f.render_widget(Clear, area);
         
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Double)
+            .border_type(BorderType::Thick)
             .title(" ⚠ Connection Error ")
             .title_alignment(Alignment::Center)
             .style(Style::default())
@@ -1875,6 +2113,320 @@ fn ui(f: &mut Frame, app: &mut App) {
             .wrap(Wrap { trim: true });
             
         f.render_widget(p, area);
+    }
+}
+
+fn render_player_ui(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    match app.layout.as_str() {
+        "Sidebar" => render_sidebar_layout(f, app, theme, area),
+        "Studio" => render_studio_layout(f, app, theme, area),
+        "Zen" => render_zen_layout(f, app, theme, area),
+        _ => render_standard_layout(f, app, theme, area),
+    }
+}
+
+fn render_standard_layout(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let content_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .split(area);
+
+    let left_side = content_chunks[0];
+    let spectrogram_area = content_chunks[1];
+
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Length(6),
+            Constraint::Min(0),
+        ])
+        .split(left_side);
+
+    render_logo(f, theme, left_chunks[0]);
+    render_now_playing(f, app, theme, left_chunks[1]);
+    render_queue(f, app, theme, left_chunks[2]);
+    render_visualizer(f, app, theme, spectrogram_area);
+}
+
+fn render_sidebar_layout(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(70), // Bigger Viz
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    let main_side = chunks[0];
+    let sidebar = chunks[1];
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(6),
+        ])
+        .split(main_side);
+
+    let sidebar_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Min(0),
+        ])
+        .split(sidebar);
+
+    render_visualizer(f, app, theme, main_chunks[0]);
+    render_now_playing(f, app, theme, main_chunks[1]);
+    render_logo(f, theme, sidebar_chunks[0]);
+    render_queue(f, app, theme, sidebar_chunks[1]);
+}
+
+fn render_studio_layout(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Min(0),
+            Constraint::Length(8),
+        ])
+        .split(area);
+
+    let top_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[0]);
+
+    render_logo(f, theme, top_row[0]);
+    render_now_playing(f, app, theme, top_row[1]);
+    render_visualizer(f, app, theme, chunks[1]);
+    render_queue(f, app, theme, chunks[2]);
+}
+
+fn render_zen_layout(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(6),
+        ])
+        .split(area);
+
+    render_visualizer(f, app, theme, chunks[0]);
+    render_now_playing(f, app, theme, chunks[1]);
+}
+
+fn render_logo(f: &mut Frame, theme: &Theme, area: Rect) {
+    let art_text: Vec<Line> = ASCII_LOGO.iter().map(|s| Line::from(Span::styled(*s, Style::default().fg(theme.primary)))).collect();
+    let art_paragraph = Paragraph::new(art_text)
+        .alignment(Alignment::Center)
+        .block(Block::default());
+    f.render_widget(art_paragraph, area);
+}
+
+fn render_now_playing(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let playing_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.border))
+        .title(" Now Playing ")
+        .title_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD));
+
+    if let Some(current) = &app.current_track {
+        let (title, artist) = if let Some((t, a)) = current.split_once(" - ") {
+            (t, a)
+        } else {
+            (current.as_str(), "Unknown Artist")
+        };
+
+        let play_info = vec![
+            Line::from(vec![
+                Span::styled(" > ", Style::default().fg(theme.primary)),
+                Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("   by ", Style::default().fg(theme.text_secondary)),
+                Span::styled(artist, Style::default().fg(theme.highlight)),
+            ]),
+        ];
+
+        let p = Paragraph::new(play_info).block(playing_block.clone());
+        f.render_widget(p, area);
+
+        if app.duration_ms > 0 {
+            let ratio = (app.elapsed_ms as f64 / app.duration_ms as f64).min(1.0);
+            let time_str = format!(
+                " {:02}:{:02} / {:02}:{:02} ",
+                app.elapsed_ms / 60000,
+                (app.elapsed_ms % 60000) / 1000,
+                app.duration_ms / 60000,
+                (app.duration_ms % 60000) / 1000,
+            );
+
+            let gauge = Gauge::default()
+                .block(Block::default().padding(ratatui::widgets::Padding::horizontal(2)))
+                .gauge_style(Style::default().fg(theme.primary).bg(Color::Rgb(30, 30, 40)))
+                .ratio(ratio)
+                .label(time_str)
+                .use_unicode(true);
+            
+            let gauge_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(0)])
+                .split(area)[1];
+            
+            f.render_widget(gauge, gauge_area);
+        }
+    } else {
+        f.render_widget(Paragraph::new("Nothing is playing").block(playing_block).alignment(Alignment::Center), area);
+    }
+}
+
+fn render_queue(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let loop_status = app.loop_mode.to_uppercase();
+    let loading_indicator = if app.is_loading { " [L] " } else { " " };
+    let title = format!(" Queue ({}){} ", loop_status, loading_indicator);
+    
+    let content_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.border))
+        .title_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
+        .title(title);
+
+    if let Some(err) = &app.error_message {
+        let p = Paragraph::new(format!("! {}", err))
+            .style(Style::default().fg(Color::Red))
+            .block(content_block)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, area);
+    } else {
+        let mut items = Vec::new();
+        if !app.queue.is_empty() {
+             for (i, track) in app.queue.iter().enumerate() {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {:2}. ", i + 1), Style::default().fg(theme.primary)),
+                    Span::styled(track, Style::default().fg(theme.text_secondary)),
+                ])));
+            }
+        } else {
+             items.push(ListItem::new(Span::styled("   Queue is empty", Style::default().fg(Color::DarkGray))));
+        }
+
+        let list = List::new(items).block(content_block);
+        f.render_widget(list, area);
+    }
+}
+
+fn render_visualizer(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let spec_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.border))
+        .title(" Visualizer ")
+        .title_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD));
+
+    if app.current_track.is_some() {
+        let (b_w, b_g) = match app.viz_style.as_str() {
+            "Blocky" => (area.width / 64, 0),
+            "Line" => (1, 0),
+            "Wave" => (1, 0),
+            "Dots" => (1, 1),
+            _ => (2, 1),
+        };
+
+        let num_bars = if app.viz_style == "Wave" || app.viz_style == "Dots" {
+            (area.width as usize).min(128)
+        } else {
+            ((area.width / (b_w + b_g)) as usize).min(64)
+        };
+
+        let mut bar_items = Vec::with_capacity(num_bars);
+
+        if num_bars > 0 {
+            let start_bin = 3.0;
+            let end_bin = 61.0;
+            let bins_to_show = end_bin - start_bin;
+            let bins_per_bar = bins_to_show / num_bars as f32;
+
+            for j in 0..num_bars {
+                let start_f = start_bin + j as f32 * bins_per_bar;
+                let end_f = start_bin + (j + 1) as f32 * bins_per_bar;
+                let mut sum = 0.0;
+                let mut weight = 0.0;
+                for i in 0..64 {
+                    let overlap = ((i + 1) as f32).min(end_f) - (i as f32).max(start_f);
+                    if overlap > 0.0 {
+                        sum += app.smoothed_bars[i] * overlap;
+                        weight += overlap;
+                    }
+                }
+                bar_items.push((if weight > 0.0 { sum / weight } else { 0.0 }) as u64);
+            }
+        }
+
+        let bars: Vec<Bar> = bar_items.iter().enumerate()
+            .map(|(i, &v)| {
+                let color = match app.viz_style.as_str() {
+                    "Blocky" | "Wave" => {
+                        if i < num_bars / 3 { theme.primary }
+                        else if i < 2 * num_bars / 3 { theme.highlight }
+                        else { Color::Rgb(200, 200, 255) }
+                    },
+                    "Line" => theme.highlight,
+                    _ => { // Bars (Gradient)
+                        if i < num_bars / 4 { theme.primary }
+                        else if i < num_bars / 2 { theme.highlight }
+                        else { Color::Rgb(200, 200, 255) }
+                    }
+                };
+
+                let label = if app.viz_style == "Line" || app.viz_style == "Wave" { String::new() } else { format!("{:2}", v.min(99)) };
+
+                Bar::default()
+                    .value(v)
+                    .label(Span::from(label))
+                    .style(Style::default().fg(color))
+                    .text_value(String::new())
+            })
+            .collect();
+        
+        let bar_group = BarGroup::default().bars(&bars);
+        let spec_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(spec_block.inner(area));
+
+        let barchart = BarChart::default()
+            .data(bar_group)
+            .bar_width(b_w.max(1))
+            .bar_gap(b_g)
+            .max(100) 
+            .label_style(Style::default().fg(theme.text_secondary));
+        
+        f.render_widget(spec_block, area);
+        f.render_widget(barchart, spec_chunks[0]);
+
+        if app.viz_style != "Wave" && app.viz_style != "Dots" {
+            let labels = ["40", "100", "500", "1k", "5k", "10k", "16k"];
+            let mut label_spans = Vec::new();
+            let total_w = spec_chunks[1].width as usize;
+            if total_w > 10 {
+                for (i, &l) in labels.iter().enumerate() {
+                    let pos = (i as f32 / (labels.len() - 1) as f32 * (total_w - l.len()) as f32) as usize;
+                    let current_len: usize = label_spans.iter().map(|s: &Span| s.content.len()).sum();
+                    if pos > current_len { label_spans.push(Span::raw(" ".repeat(pos - current_len))); }
+                    label_spans.push(Span::styled(l, Style::default().fg(theme.text_secondary)));
+                }
+                f.render_widget(Paragraph::new(Line::from(label_spans)), spec_chunks[1]);
+            }
+        }
+    } else {
+        f.render_widget(Paragraph::new("Idle (No Track)").block(spec_block).alignment(Alignment::Center), area);
     }
 }
 

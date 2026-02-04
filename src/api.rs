@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PlayPayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
@@ -17,14 +17,14 @@ pub struct PlayPayload {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SimplePayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
     pub user_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct QueuePayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
@@ -33,7 +33,7 @@ pub struct QueuePayload {
     pub offset: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct LoopPayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
@@ -41,7 +41,7 @@ pub struct LoopPayload {
     pub loop_mode: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct TwentyFourSevenPayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
@@ -49,7 +49,7 @@ pub struct TwentyFourSevenPayload {
     pub enabled: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FilterPayload {
     pub action: &'static str,
     pub guild_id: Option<String>,
@@ -57,7 +57,7 @@ pub struct FilterPayload {
     pub filters: AudioFilters,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct LyricsPayload {
     pub action: String,
     pub guild_id: Option<String>,
@@ -182,6 +182,8 @@ pub struct WsEvent {
     pub guild_id: Option<String>,
     pub data: Option<Value>,
     pub playback: Option<PlaybackState>,
+    pub success: Option<bool>,
+    pub id: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -202,14 +204,32 @@ pub struct WsSubscribe {
     pub guild_id: String,
 }
 
+#[derive(Serialize)]
+pub struct WsAction<T> {
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+    pub id: String,
+    #[serde(flatten)]
+    pub payload: T,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub base_url: String,
     #[serde(default = "default_offset")]
     pub visualizer_offset: i64,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default = "default_viz")]
+    pub visualizer_style: String,
+    #[serde(default = "default_layout")]
+    pub layout: String,
 }
 
-fn default_offset() -> i64 { 200 }
+fn default_offset() -> i64 { 0 }
+fn default_theme() -> String { "Default".to_string() }
+fn default_viz() -> String { "Bars".to_string() }
+fn default_layout() -> String { "Standard".to_string() }
 
 pub fn config_file_path() -> Option<PathBuf> {
     config_dir().map(|p| p.join("jorik-cli").join("auth.json"))
@@ -229,7 +249,10 @@ pub fn load_settings() -> Settings {
     }
     Settings {
         base_url: "https://jorik.xserv.pp.ua".to_string(),
-        visualizer_offset: 200,
+        visualizer_offset: 0,
+        theme: "Default".to_string(),
+        visualizer_style: "Bars".to_string(),
+        layout: "Standard".to_string(),
     }
 }
 
@@ -261,7 +284,6 @@ pub fn save_token(token: &str, avatar_url: Option<&str>, username: Option<&str>)
 }
 
 pub fn load_auth() -> Option<Auth> {
-    // Try to load the canonical auth.json first.
     if let Some(path) = config_file_path() {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(auth) = serde_json::from_str::<Auth>(&contents) {
@@ -269,11 +291,6 @@ pub fn load_auth() -> Option<Auth> {
             }
         }
     }
-    // Note: Legacy token fallback removed from shared logic to keep it simple,
-    // or we can add it back if strictly necessary, but main.rs had specific printing logic.
-    // For now, let's include it but without the printing side-effects if possible,
-    // or just rely on auth.json.
-    // The original code printed a warning.
     None
 }
 

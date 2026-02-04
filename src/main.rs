@@ -250,7 +250,6 @@ async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)>
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // If user requested --version/-V, print enhanced version info and exit early.
     {
         let args: Vec<_> = std::env::args_os().collect();
         let mut want_version = false;
@@ -282,15 +281,12 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
     
-    // Load settings from settings.json
     let settings = api::load_settings();
     
-    // If base_url is the default one, but settings.json has a different one, use the one from settings.json
     if cli.base_url == "https://jorik.xserv.pp.ua" && settings.base_url != "https://jorik.xserv.pp.ua" {
         cli.base_url = settings.base_url.clone();
     }
     
-    // Check if we are running TUI first, to avoid printing update checks to stdout
     if let Commands::Tui { guild_id, user_id } = cli.command {
         return tui::run(
             settings,
