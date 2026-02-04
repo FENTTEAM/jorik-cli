@@ -164,7 +164,7 @@ begin
   try ExtractTemporaryFile('logo.png'); LogoImage.PngImage.LoadFromFile(ExpandConstant('{tmp}\logo.png')); except end;
 
   CreditLabel := TNewStaticText.Create(WizardForm);
-  CreditLabel.Caption := 'by xxanqw'; StyleLabel(CreditLabel, 8, [], clGrayText);
+  CreditLabel.Caption := 'FireFly Team'; StyleLabel(CreditLabel, 8, [], clGrayText);
   CreditLabel.Parent := WizardForm;
   CreditLabel.Left := ScaleX(24);
   CreditLabel.Top := WizardForm.NextButton.Top + (WizardForm.NextButton.Height - CreditLabel.Height) div 2;
