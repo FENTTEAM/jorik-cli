@@ -196,20 +196,20 @@ enum AuthSubcommand {
     Info,
 }
 
-#[derive(serde::Deserialize)]
-struct GiteaAsset {
-    name: String,
-    browser_download_url: String,
+#[derive(serde::Deserialize, Clone)]
+pub struct GiteaAsset {
+    pub name: String,
+    pub browser_download_url: String,
 }
 
 #[derive(serde::Deserialize)]
-struct GiteaRelease {
-    tag_name: String,
-    assets: Vec<GiteaAsset>,
+pub struct GiteaRelease {
+    pub tag_name: String,
+    pub assets: Vec<GiteaAsset>,
 }
 
-async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)> {
-    let url = "https://api.github.com/repos/FENTTEAM/jorik-cli/releases";
+pub async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)> {
+    let url = "https://api.github.com/repos/fireflyteam/jorik-cli/releases";
     let res = client
         .get(url)
         .header("User-Agent", "jorik-cli")
@@ -229,10 +229,11 @@ async fn check_for_updates(client: &Client) -> Option<(String, Vec<GiteaAsset>)>
     let mut update_found = false;
     let mut latest_release_info = None;
 
-    // Filter to find the absolute latest version (including prereleases if they are newer)
+    // Filter to find the absolute latest version
     for release in releases {
         let clean_name = release.tag_name.trim_start_matches('v');
         if let Ok(version) = Version::parse(clean_name) {
+            // Version comparison: 0.4.0 > 0.4.0-g is true in semver
             if version > latest_version {
                 latest_version = version;
                 latest_release_info = Some((release.tag_name, release.assets));
@@ -287,20 +288,23 @@ async fn main() -> Result<()> {
         cli.base_url = settings.base_url.clone();
     }
     
-    if let Commands::Tui { guild_id, user_id } = cli.command {
-        return tui::run(
-            settings,
-            cli.token.or_else(load_token),
-            guild_id,
-            user_id
-        ).await;
-    }
-
     let client = Client::builder()
         .user_agent("jorik-cli")
         .timeout(Duration::from_secs(10))
         .build()
         .context("building HTTP client")?;
+
+    if let Commands::Tui { guild_id, user_id } = cli.command {
+        if let Some((latest, assets)) = tui::run(
+            settings,
+            cli.token.or_else(load_token),
+            guild_id,
+            user_id
+        ).await? {
+             return trigger_update(&client, &latest, &assets).await;
+        }
+        return Ok(());
+    }
 
     let update_client = client.clone();
     let update_check = tokio::spawn(async move { check_for_updates(&update_client).await });
@@ -577,69 +581,74 @@ async fn main() -> Result<()> {
         io::stdin().read_line(&mut input)?;
 
         if input.trim().eq_ignore_ascii_case("y") {
-            if cfg!(target_os = "linux") {
-                println!("Running update script...");
-                let status = Command::new("sh")
-                    .arg("-c")
-                    .arg("curl -sL https://shorty.pp.ua/jorikcli | bash")
-                    .status()
-                    .context("Failed to execute update script")?;
-
-                if status.success() {
-                    println!(
-                        "\n{}",
-                        "Update successful! You can now use the latest version."
-                            .green()
-                            .bold()
-                    );
-                } else {
-                    println!("\n{}", "Update failed.".red().bold());
-                }
-            } else if cfg!(target_os = "windows") {
-                if let Some(asset) = assets.iter().find(|a| a.name.ends_with("setup.exe")) {
-                    println!("Downloading installer...");
-                    let temp_dir = std::env::temp_dir();
-                    let installer_path = temp_dir.join(&asset.name);
-
-                    {
-                        let mut file = File::create(&installer_path)?;
-                        let mut response = client.get(&asset.browser_download_url).send().await?;
-
-                        if !response.status().is_success() {
-                            bail!("Failed to download installer: {}", response.status());
-                        }
-
-                        while let Some(chunk) = response.chunk().await? {
-                            file.write_all(&chunk)?;
-                        }
-                    }
-
-                    println!("Running installer...");
-                    Command::new(&installer_path)
-                        .arg("/SILENT")
-                        .spawn()
-                        .context("Failed to start installer")?;
-
-                    println!(
-                        "\n{}",
-                        "Update started! The application will now exit to complete the installation."
-                            .green()
-                            .bold()
-                    );
-                    std::process::exit(0);
-                } else {
-                    println!("{}", "No Windows installer found for this release.".red());
-                    println!(
-                        "Download it manually at: https://git.xserv.pp.ua/xxanqw/jorik-cli/releases"
-                    );
-                }
-            } else {
-                println!("Automatic updates are not supported on this platform.");
-                println!("Download it at: https://git.xserv.pp.ua/xxanqw/jorik-cli/releases");
-            }
+            trigger_update(&client, &latest, &assets).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn trigger_update(client: &Client, _latest: &str, assets: &[GiteaAsset]) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        println!("Running update script...");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("curl -sL https://shorty.pp.ua/jorikcli | bash")
+            .status()
+            .context("Failed to execute update script")?;
+
+        if status.success() {
+            println!(
+                "\n{}",
+                "Update successful! You can now use the latest version."
+                    .green()
+                    .bold()
+            );
+        } else {
+            println!("\n{}", "Update failed.".red().bold());
+        }
+    } else if cfg!(target_os = "windows") {
+        if let Some(asset) = assets.iter().find(|a| a.name.ends_with("setup.exe")) {
+            println!("Downloading installer...");
+            let temp_dir = std::env::temp_dir();
+            let installer_path = temp_dir.join(&asset.name);
+
+            {
+                let mut file = File::create(&installer_path)?;
+                let mut response = client.get(&asset.browser_download_url).send().await?;
+
+                if !response.status().is_success() {
+                    bail!("Failed to download installer: {}", response.status());
+                }
+
+                while let Some(chunk) = response.chunk().await? {
+                    file.write_all(&chunk)?;
+                }
+            }
+
+            println!("Running installer...");
+            Command::new(&installer_path)
+                .arg("/SILENT")
+                .spawn()
+                .context("Failed to start installer")?;
+
+            println!(
+                "\n{}",
+                "Update started! The application will now exit to complete the installation."
+                    .green()
+                    .bold()
+            );
+            std::process::exit(0);
+        } else {
+            println!("{}", "No Windows installer found for this release.".red());
+            println!(
+                "Download it manually at: https://github.com/fireflyteam/jorik-cli/releases"
+            );
+        }
+    } else {
+        println!("Automatic updates are not supported on this platform.");
+        println!("Download it at: https://github.com/fireflyteam/jorik-cli/releases");
+    }
     Ok(())
 }
 

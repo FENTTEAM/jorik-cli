@@ -18,7 +18,7 @@ use tokio::time::{interval, timeout};
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use futures_util::{StreamExt, SinkExt};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, tungstenite::{protocol::Message, client::IntoClientRequest, http::HeaderValue}};
 use url::Url;
 
 
@@ -108,6 +108,7 @@ enum View {
     Settings,
     Debug,
     AppInfo,
+    UpdateFound,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -167,6 +168,8 @@ struct App {
     is_settings_editing: bool,
     needs_reconnect: bool,
     visualizer_offset: i64,
+
+    update_info: Option<(String, Vec<api::GiteaAsset>)>,
 
     debug_logs: Vec<String>,
     ws_connected: bool,
@@ -241,6 +244,7 @@ impl App {
             is_settings_editing: false,
             needs_reconnect: false,
             visualizer_offset: settings.visualizer_offset,
+            update_info: None,
             debug_logs: Vec::new(),
             ws_connected: false,
             ws_connecting: false,
@@ -927,7 +931,26 @@ async fn spawn_websocket(app_arc: Arc<Mutex<App>>, mut ws_rx: tokio::sync::mpsc:
             app.ws_connecting = true;
         }
 
-        match connect_async(ws_url.as_str()).await {
+        let request = match ws_url.as_str().into_client_request() {
+            Ok(mut req) => {
+                let headers = req.headers_mut();
+                headers.insert("User-Agent", HeaderValue::from_static("jorik-cli"));
+                headers.insert("Origin", HeaderValue::from_str(&base_url).unwrap_or_else(|_| HeaderValue::from_static("jorik-cli")));
+                if let Some(host) = ws_url.host_str() {
+                    headers.insert("Host", HeaderValue::from_str(host).unwrap_or_else(|_| HeaderValue::from_static("localhost")));
+                }
+                headers.insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", token)).unwrap_or_else(|_| HeaderValue::from_static("")));
+                req
+            }
+            Err(e) => {
+                let mut app = app_arc.lock().await;
+                app.log(format!("WS Request Error: {}", e));
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        match connect_async(request).await {
             Ok((mut ws_stream, _)) => {
                 {
                     let mut app = app_arc.lock().await;
@@ -1079,7 +1102,7 @@ pub async fn run(
     token: Option<String>,
     guild_id: Option<String>,
     user_id: Option<String>,
-) -> Result<()> {
+) -> Result<Option<(String, Vec<api::GiteaAsset>)>> {
     let client = Client::builder()
         .user_agent("jorik-cli-tui")
         .timeout(Duration::from_secs(10))
@@ -1087,7 +1110,7 @@ pub async fn run(
 
     let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
-    let mut app_struct = App::new(client, settings, token, guild_id, user_id);
+    let mut app_struct = App::new(client.clone(), settings, token, guild_id, user_id);
     app_struct.ws_sender = Some(ws_tx);
     
     let app = Arc::new(Mutex::new(app_struct));
@@ -1095,6 +1118,16 @@ pub async fn run(
     // Initial fetch
     tokio::spawn(async_fetch_queue(app.clone()));
     tokio::spawn(spawn_websocket(app.clone(), ws_rx));
+
+    let app_update = app.clone();
+    let client_update = client.clone();
+    tokio::spawn(async move {
+        if let Some(update) = crate::check_for_updates(&client_update).await {
+            let mut app = app_update.lock().await;
+            app.update_info = Some(update);
+            app.view = View::UpdateFound;
+        }
+    });
 
     let app_clone = app.clone();
     tokio::spawn(async move {
@@ -1112,7 +1145,7 @@ pub async fn run(
     res
 }
 
-async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> Result<()> {
+async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> Result<Option<(String, Vec<api::GiteaAsset>)>> {
     loop {
         {
             let mut app = app_arc.lock().await;
@@ -1166,16 +1199,21 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
 
                     // Global Quit (q) - except in Settings where it might be typed
                     if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('й')) && app.view != View::Settings {
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     // View-Specific Handlers
                     match app.view {
+                        View::UpdateFound => {
+                            if let Some(update) = handle_update_keys(&mut *app, key) {
+                                return Ok(Some(update));
+                            }
+                        }
                         View::Main => handle_player_keys(&mut *app, key, app_arc.clone()),
                         View::Lyrics => handle_lyrics_keys(&mut *app, key),
                         View::Settings => handle_settings_keys(&mut *app, key, app_arc.clone()),
                         View::Debug => handle_debug_keys(&mut *app, key),
-                        View::Menu => { if handle_menu_keys(&mut *app, key, app_arc.clone())? { return Ok(()); } },
+                        View::Menu => { if handle_menu_keys(&mut *app, key, app_arc.clone())? { return Ok(None); } },
                         View::FilterMenu => handle_filter_menu_keys(&mut *app, key, app_arc.clone()),
                         View::AuthMenu => handle_auth_menu_keys(&mut *app, key, app_arc.clone()),
                         View::AuthResult => {
@@ -1195,7 +1233,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app_arc: Arc<Mutex<App>>) -> R
                                 app.settings_input = app.base_url.clone();
                                 app.view = View::Settings;
                             } else if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('й')) {
-                                return Ok(());
+                                return Ok(None);
                             }
                         }
                     }
@@ -1220,6 +1258,19 @@ fn handle_editing_keys(app: &mut App, key: event::KeyEvent, app_arc: Arc<Mutex<A
         KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => { app.input.pop(); }
         _ => {}
+    }
+}
+
+fn handle_update_keys(app: &mut App, key: event::KeyEvent) -> Option<(String, Vec<api::GiteaAsset>)> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('н') | KeyCode::Char('Н') => {
+            app.update_info.clone()
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('т') | KeyCode::Char('Т') | KeyCode::Esc => {
+            app.view = View::Main;
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1642,6 +1693,52 @@ fn ui(f: &mut Frame, app: &mut App) {
     
     // Base background color for the entire UI
     f.render_widget(Block::default().bg(theme.bg), f.area());
+
+    if app.view == View::UpdateFound {
+        let area = centered_rect(60, 40, f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .title(" 🚀 Update Available ")
+            .title_alignment(Alignment::Center)
+            .border_style(Style::default().fg(Color::Green));
+
+        let version = app.update_info.as_ref().map(|(v, _)| v.as_str()).unwrap_or("Unknown");
+        
+        let text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("A new version "),
+                Span::styled(version, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" is available!"),
+            ]),
+            Line::from(""),
+            Line::from("Do you want to update now?"),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Press "),
+                Span::styled(" y ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::raw(" to Update and Exit"),
+            ]),
+            Line::from(vec![
+                Span::raw("Press "),
+                Span::styled(" n ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::raw(" to Skip for now"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("The update will be installed automatically upon exit.", Style::default().fg(theme.text_secondary))),
+        ];
+
+        let p = Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(block)
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(p, area);
+        return;
+    }
 
     if app.view == View::LoginRequired {
         let area = f.area();

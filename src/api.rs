@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+pub use crate::GiteaAsset;
 use dirs::config_dir;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
